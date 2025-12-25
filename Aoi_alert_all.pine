@@ -1,0 +1,1834 @@
+//@version=6
+indicator("AOI Suite v6 FINAL + Alerts Builder (Merged) — FINAL FIX (Stable)", shorttitle="AOIReg+Alerts", overlay=true,
+     max_lines_count=500, max_labels_count=500, scale=scale.right)
+
+//==============================
+// Groups
+//==============================
+string grpBase   = "0) Base"
+string grpLTF    = "1) LTF / Core"
+string grpQual   = "2) Quality / Fusion"
+string grpWin    = "3) Summary Window (Tables)"
+string grpUI     = "4) UI (Labels/Tables Style)"
+string grpSlots  = "5) Horizontal Slots"
+string grpFeat   = "6) Metric Toggles (Label/Table)"
+string grpPlots  = "7) Plots"
+string grpAlerts = "8) Alerts Builder (Merged)"
+
+//==============================
+// Base inputs
+//==============================
+int   precision_num = input.int(3, "Precision", minval=0, maxval=8, group=grpBase)
+float order_size    = input.float(1.0, "Avg order size (estimate)", minval=1e-9, step=0.1, group=grpBase)
+float eps_user      = input.float(1e-9, "EPS (avoid div0)", minval=1e-12, step=1e-9, group=grpBase)
+
+//==============================
+// Feature toggles
+//==============================
+bool feat_core      = input.bool(true,  "Enable Core (AOI/Activity/Pressure)", group=grpLTF)
+bool feat_mtf       = input.bool(true,  "Enable MTF Pressure (Vote/Conviction/Fusion)", group=grpLTF)
+bool feat_impedance = input.bool(true,  "Enable Flow Impedance", group=grpLTF)
+bool feat_entropy   = input.bool(false, "Enable Entropy (heavy)", group=grpLTF)
+bool feat_ttt       = input.bool(false, "Enable Time-To-Threshold (heavy)", group=grpLTF)
+bool feat_adv_accel = input.bool(true,  "Enable Advanced Accel (Jerk/Norm/Dir)", group=grpLTF)
+
+//==============================
+// LTF / MTF inputs
+//==============================
+string ltf_mode        = input.string("Auto", "Lower TF Mode", options=["Auto", "Manual"], group=grpLTF)
+string ltf_manual      = input.timeframe("5S", "Lower TF (Manual)", group=grpLTF)
+
+string mtf_mode        = input.string("Auto", "MTF TF Mode", options=["Auto", "Manual"], group=grpLTF)
+string mtf_fast_manual = input.timeframe("1S",  "MTF Fast TF (Manual)", group=grpLTF)
+string mtf_mid_manual  = input.timeframe("5S",  "MTF Mid TF (Manual)", group=grpLTF)
+string mtf_slow_manual = input.timeframe("15S", "MTF Slow TF (Manual)", group=grpLTF)
+
+int    ema_len         = input.int(10,  "EMA length (Activity)", minval=1, group=grpLTF)
+int    max_subbars     = input.int(600, "Max sub-bars (LTF)", minval=50, maxval=5000, group=grpLTF)
+int    adv_std_len     = input.int(40,  "Noise window (stdev) for acc_norm", minval=5, maxval=500, group=grpLTF)
+
+//==============================
+// Quality inputs
+//==============================
+float  min_coverage    = input.float(0.90, "Min LTF coverage", minval=0.1, maxval=1.0, group=grpQual)
+float  min_vol_ratio   = input.float(0.97, "Min vol ratio (LTF/Chart)", minval=0.1, maxval=2.0, group=grpQual)
+float  max_vol_ratio   = input.float(1.03, "Max vol ratio (LTF/Chart)", minval=0.1, maxval=2.0, group=grpQual)
+float  q_tol           = input.float(0.03, "Quality tolerance (|vr-1|<=tol)", minval=0.001, maxval=0.5, group=grpQual)
+
+string src_aoi_total   = input.string("Auto(Quality)", "AOI_total Source", options=["Auto(Quality)", "ChartVol", "LTFVol"], group=grpQual)
+string pressure_source = input.string("Fused(Quality)", "Pressure Used", options=["Base(LTF)", "Fused(Quality)", "Fast", "Mid", "Slow"], group=grpQual)
+
+float  thr_ttt         = input.float(0.25, "TTT threshold |P_norm|", minval=0.01, maxval=0.99, group=grpQual)
+string abs_metric_mode = input.string("TPV (T/Vol)", "Absolute Metric", options=["TPV (T/Vol)", "AOI_total (T*order/Vol)"], group=grpQual)
+
+//==============================
+// Summary Window (Tables)
+//==============================
+string summary_mode     = input.string("All data", "Tables mode", options=["All data", "Time range", "Last N"], group=grpWin)
+int    N_last_bars_tbl  = input.int(300, "N (Last N)", minval=1, maxval=5000, group=grpWin)
+
+// input.time defval باید ثابت (ms) باشد
+int    from_datetime    = input.time(1735689600000, "From datetime (UTC)", group=grpWin)  // 2025-01-01 00:00 UTC
+int    to_datetime      = input.time(1767225540000, "To datetime (UTC)", group=grpWin)    // 2025-12-31 23:59 UTC
+
+//==============================
+// Helpers (core-safe)
+//==============================
+clamp01(float x) => math.max(0.0, math.min(1.0, x))
+sgn(float x) => na(x) ? 0 : (x > 0 ? 1 : (x < 0 ? -1 : 0))
+
+// ✅ Stable numeric formatter (no dynamic format strings)
+fmt(float x, int p) =>
+    if na(x)
+        "na"
+    else
+        switch p
+            0 => str.format("{0,number,0}", x)
+            1 => str.format("{0,number,0.0}", x)
+            2 => str.format("{0,number,0.00}", x)
+            3 => str.format("{0,number,0.000}", x)
+            4 => str.format("{0,number,0.0000}", x)
+            5 => str.format("{0,number,0.00000}", x)
+            6 => str.format("{0,number,0.000000}", x)
+            7 => str.format("{0,number,0.0000000}", x)
+            8 => str.format("{0,number,0.00000000}", x)
+            => str.tostring(x)
+
+accel(float x) => (not na(x) and not na(x[1])) ? (x - x[1]) : na
+accel_pct(float x) => (not na(x) and not na(x[1]) and x[1] != 0) ? (100.0 * (x - x[1]) / x[1]) : na
+jerk(float x) => (not na(x) and not na(x[1]) and not na(x[2])) ? (x - 2.0 * x[1] + x[2]) : na
+
+// ✅ Normalize acceleration by stdev of acceleration (not stdev of x)
+acc_norm(float x, int len) =>
+    float a  = accel(x)
+    float sd = ta.stdev(accel(x), len)
+    (not na(a) and not na(sd)) ? (a / (sd + eps_user)) : na
+
+// IMPORTANT: arr_time must exist BEFORE selectors
+var int[] arr_time = array.new_int()
+
+//==============================
+// History Helpers
+//==============================
+mean_na(float[] a) =>
+    int sz = array.size(a)
+    if sz == 0
+        na
+    else
+        float s = 0.0
+        int c = 0
+        for i = 0 to sz - 1
+            float v = array.get(a, i)
+            if not na(v)
+                s += v
+                c += 1
+        c > 0 ? (s / c) : na
+
+sum_na(float[] a) =>
+    int sz = array.size(a)
+    if sz == 0
+        na
+    else
+        float s = 0.0
+        bool has = false
+        for i = 0 to sz - 1
+            float v = array.get(a, i)
+            if not na(v)
+                s += v
+                has := true
+        has ? s : na
+
+mean_lastN(float[] a, int N) =>
+    int sz = array.size(a)
+    if sz == 0
+        na
+    else
+        int use = math.min(N, sz)
+        if use <= 0
+            na
+        else
+            float s = 0.0
+            int c = 0
+            for j = 0 to use - 1
+                float v = array.get(a, sz - 1 - j)
+                if not na(v)
+                    s += v
+                    c += 1
+            c > 0 ? (s / c) : na
+
+sum_lastN(float[] a, int N) =>
+    int sz = array.size(a)
+    if sz == 0
+        na
+    else
+        int use = math.min(N, sz)
+        if use <= 0
+            na
+        else
+            float s = 0.0
+            bool has = false
+            for j = 0 to use - 1
+                float v = array.get(a, sz - 1 - j)
+                if not na(v)
+                    s += v
+                    has := true
+            has ? s : na
+
+mean_range(float[] a, int[] t, int tFrom, int tTo) =>
+    int sz = array.size(a)
+    if sz == 0
+        na
+    else
+        float s = 0.0
+        int c = 0
+        for i = 0 to sz - 1
+            int tt = array.get(t, i)
+            if tt >= tFrom and tt <= tTo
+                float v = array.get(a, i)
+                if not na(v)
+                    s += v
+                    c += 1
+        c > 0 ? (s / c) : na
+
+sum_range(float[] a, int[] t, int tFrom, int tTo) =>
+    int sz = array.size(a)
+    if sz == 0
+        na
+    else
+        float s = 0.0
+        bool has = false
+        for i = 0 to sz - 1
+            int tt = array.get(t, i)
+            if tt >= tFrom and tt <= tTo
+                float v = array.get(a, i)
+                if not na(v)
+                    s += v
+                    has := true
+        has ? s : na
+
+mean_sel(float[] a) =>
+    summary_mode == "All data" ? mean_na(a) :
+     summary_mode == "Time range" ? mean_range(a, arr_time, from_datetime, to_datetime) :
+     mean_lastN(a, N_last_bars_tbl)
+
+sum_sel(float[] a)  =>
+    summary_mode == "All data" ? sum_na(a) :
+     summary_mode == "Time range" ? sum_range(a,  arr_time, from_datetime, to_datetime) :
+     sum_lastN(a,  N_last_bars_tbl)
+
+//==============================
+// Auto TF selectors (simple-safe)
+//==============================
+auto_ltf(simple int cs) =>
+    string tf = "5S"
+    if cs <= 60
+        tf := "1S"
+    else if cs <= 5 * 60
+        tf := "5S"
+    else if cs <= 15 * 60
+        tf := "15S"
+    else if cs <= 60 * 60
+        tf := "1"
+    else if cs <= 4 * 60 * 60
+        tf := "5"
+    else
+        tf := "15"
+    tf
+
+auto_mtf_fast(simple int cs) =>
+    string t = "1S"
+    if cs <= 60
+        t := "1S"
+    else if cs <= 15 * 60
+        t := "5S"
+    else if cs <= 60 * 60
+        t := "15S"
+    else
+        t := "1"
+    t
+
+auto_mtf_mid(simple int cs) =>
+    string t = "5S"
+    if cs <= 60
+        t := "5S"
+    else if cs <= 15 * 60
+        t := "15S"
+    else if cs <= 60 * 60
+        t := "1"
+    else
+        t := "5"
+    t
+
+auto_mtf_slow(simple int cs) =>
+    string t = "15S"
+    if cs <= 60
+        t := "15S"
+    else if cs <= 15 * 60
+        t := "1"
+    else if cs <= 60 * 60
+        t := "5"
+    else
+        t := "15"
+    t
+
+//==============================
+// Timebase and effective TFs
+//==============================
+int   chart_sec   = timeframe.in_seconds(timeframe.period)
+float chart_sec_f = float(chart_sec)
+
+var float interval_sec = na
+interval_sec := (bar_index > 0 and not na(time[1])) ? ((time - time[1]) / 1000.0) : chart_sec_f
+
+// ✅ keep TF strings simple for security calls
+simple string ltf_eff  = ltf_mode == "Auto" ? auto_ltf(chart_sec) : ltf_manual
+simple string mtf_fast = mtf_mode == "Auto" ? auto_mtf_fast(chart_sec) : mtf_fast_manual
+simple string mtf_mid  = mtf_mode == "Auto" ? auto_mtf_mid(chart_sec)  : mtf_mid_manual
+simple string mtf_slow = mtf_mode == "Auto" ? auto_mtf_slow(chart_sec) : mtf_slow_manual
+
+is_true_lower_tf(simple string tf) =>
+    int sec = timeframe.in_seconds(tf)
+    not na(sec) and sec > 0 and sec < chart_sec
+
+//==============================
+// Type-safe LTF result struct
+//==============================
+type LTFRes
+    float buyV
+    float sellV
+    float totV
+    int   actCnt
+    float press
+    float pnorm
+    float entropyH
+    float tttSec
+    float coverage
+    float vr
+    float q
+    bool  ok
+
+ltf_empty() => LTFRes.new(na, na, na, 0, na, na, na, na, na, na, 0.0, false)
+
+// ✅ NA-safe LTF calc (prevents NA-propagation inside sums)
+calc_ltf(simple string tf, bool needEntropy, bool needTTT, float thr) =>
+    float[] vA = request.security_lower_tf(syminfo.tickerid, tf, volume)
+    float[] hA = request.security_lower_tf(syminfo.tickerid, tf, high)
+    float[] lA = request.security_lower_tf(syminfo.tickerid, tf, low)
+    float[] cA = request.security_lower_tf(syminfo.tickerid, tf, close)
+
+    int n = array.size(vA)
+    int n_use = math.min(n, max_subbars)
+
+    float bSum = 0.0
+    float sSum = 0.0
+    int actCnt = 0
+
+    float entSum = 0.0
+    int entCnt = 0
+
+    float cumB = 0.0
+    float cumS = 0.0
+    bool crossed = false
+    float ttt_sec = na
+
+    int tf_sec = timeframe.in_seconds(tf)
+    float expected = (not na(tf_sec) and tf_sec > 0 and chart_sec > 0) ? (chart_sec_f / float(tf_sec)) : na
+
+    if n_use > 0
+        for i = 0 to n_use - 1
+            float v = array.get(vA, i)
+            float h = array.get(hA, i)
+            float l = array.get(lA, i)
+            float c = array.get(cA, i)
+
+            // skip unusable subbars
+            bool okSub = not na(v) and v > 0 and not na(h) and not na(l) and not na(c)
+            if okSub
+                actCnt += 1
+
+                float pr = h - l
+                float buy_i = pr != 0 ? (v * (c - l) / pr) : (v * 0.5)
+                buy_i := math.max(0.0, math.min(buy_i, v))
+                float sell_i = v - buy_i
+
+                bSum += buy_i
+                sSum += sell_i
+
+                if needEntropy
+                    float p = buy_i / (v + eps_user)
+                    p := math.max(0.0, math.min(p, 1.0))
+                    float H = -p * math.log(p + eps_user) - (1.0 - p) * math.log(1.0 - p + eps_user)
+                    entSum += H
+                    entCnt += 1
+
+                if needTTT and not crossed and not na(tf_sec) and tf_sec > 0
+                    cumB += buy_i
+                    cumS += sell_i
+                    float cumTot = cumB + cumS
+                    float pn = cumTot > 0 ? ((cumB - cumS) / cumTot) : na
+                    if not na(pn) and math.abs(pn) >= thr
+                        crossed := true
+                        ttt_sec := float(i + 1) * float(tf_sec)
+
+    float buyV   = n_use > 0 ? bSum : na
+    float sellV  = n_use > 0 ? sSum : na
+    float totV   = (not na(buyV) and not na(sellV)) ? (buyV + sellV) : na
+    float press  = (not na(buyV) and not na(sellV)) ? (buyV - sellV) : na
+    float pnorm  = (not na(totV) and totV > 0) ? (press / totV) : na
+
+    float entropyH = (needEntropy and entCnt > 0) ? (entSum / float(entCnt)) : na
+    float coverage = (not na(expected) and expected > 0) ? (float(n_use) / expected) : na
+    float vr = (not na(totV) and not na(volume) and volume > 0) ? (totV / volume) : na
+
+    bool ok = (not na(coverage) and not na(vr) and coverage >= min_coverage and vr >= min_vol_ratio and vr <= max_vol_ratio)
+    float q_raw = clamp01(coverage) * clamp01(1.0 - (math.abs(vr - 1.0) / (q_tol + eps_user)))
+    float qv = ok ? q_raw : 0.0
+    LTFRes.new(buyV, sellV, totV, actCnt, press, pnorm, entropyH, ttt_sec, coverage, vr, qv, ok)
+
+//==============================
+// Base + MTF calculations
+//==============================
+var LTFRes base = ltf_empty()
+var LTFRes mtfF = ltf_empty()
+var LTFRes mtfM = ltf_empty()
+var LTFRes mtfS = ltf_empty()
+
+if feat_core and is_true_lower_tf(ltf_eff)
+    base := calc_ltf(ltf_eff, feat_entropy, feat_ttt, thr_ttt)
+else
+    base := ltf_empty()
+
+if feat_core and feat_mtf
+    mtfF := is_true_lower_tf(mtf_fast) ? calc_ltf(mtf_fast, false, false, thr_ttt) : ltf_empty()
+    mtfM := is_true_lower_tf(mtf_mid)  ? calc_ltf(mtf_mid,  false, false, thr_ttt) : ltf_empty()
+    mtfS := is_true_lower_tf(mtf_slow) ? calc_ltf(mtf_slow, false, false, thr_ttt) : ltf_empty()
+else
+    mtfF := ltf_empty()
+    mtfM := ltf_empty()
+    mtfS := ltf_empty()
+
+//==============================
+// Core metrics calculations
+//==============================
+float vol_for_total = na
+if src_aoi_total == "ChartVol"
+    vol_for_total := volume
+else if src_aoi_total == "LTFVol"
+    vol_for_total := base.totV
+else
+    vol_for_total := base.ok ? base.totV : volume
+
+float AOI_total = (not na(interval_sec) and not na(vol_for_total) and vol_for_total > 0) ? ((interval_sec * order_size) / vol_for_total) : na
+float AOI_buy   = (not na(interval_sec) and not na(base.buyV) and base.buyV > 0) ? ((interval_sec * order_size) / base.buyV) : na
+float AOI_sell  = (not na(interval_sec) and not na(base.sellV) and base.sellV > 0) ? ((interval_sec * order_size) / base.sellV) : na
+float AOI_diff  = (not na(AOI_buy) and not na(AOI_sell)) ? (AOI_sell - AOI_buy) : na
+
+float AOI_activity = (not na(interval_sec) and base.actCnt > 0) ? (interval_sec / float(base.actCnt)) : na
+float AOI_activity_ema = ta.ema(AOI_activity, ema_len)
+
+float TPV = (not na(interval_sec) and not na(volume) and volume > 0) ? (interval_sec / volume) : na
+float AbsMetric = abs_metric_mode == "TPV (T/Vol)" ? TPV : AOI_total
+
+float Pressure_raw  = base.press
+float Pressure_norm = base.pnorm
+
+float P_fast = mtfF.pnorm
+float P_mid  = mtfM.pnorm
+float P_slow = mtfS.pnorm
+
+int   Vote_int = 0
+float Vote = na
+float Conviction = na
+float Pressure_fused = na
+
+if feat_core and feat_mtf
+    int sumS = sgn(P_fast) + sgn(P_mid) + sgn(P_slow)
+    Vote_int := sumS >= 2 ? 1 : sumS <= -2 ? -1 : 0
+    Vote := float(Vote_int)
+
+    float qsum = mtfF.q + mtfM.q + mtfS.q
+    if qsum > 0
+        Conviction := (mtfF.q * math.abs(P_fast) + mtfM.q * math.abs(P_mid) + mtfS.q * math.abs(P_slow)) / qsum
+        Pressure_fused := (mtfF.q * P_fast + mtfM.q * P_mid + mtfS.q * P_slow) / qsum
+
+float Pressure_used = na
+if pressure_source == "Base(LTF)"
+    Pressure_used := Pressure_norm
+else if pressure_source == "Fast"
+    Pressure_used := P_fast
+else if pressure_source == "Mid"
+    Pressure_used := P_mid
+else if pressure_source == "Slow"
+    Pressure_used := P_slow
+else
+    Pressure_used := not na(Pressure_fused) ? Pressure_fused : Pressure_norm
+
+float FlowImpedance = feat_impedance and feat_core ? (not na(AOI_total) ? (AOI_total / (math.abs(Pressure_used) + eps_user)) : na) : na
+float EntropyH = feat_entropy ? base.entropyH : na
+float TTT_sec  = feat_ttt ? base.tttSec : na
+
+//==============================
+// Accelerations
+//==============================
+float AOI_accel     = accel(AOI_total)
+float AOI_accel_pct = accel_pct(AOI_total)
+
+float BUY_accel     = accel(AOI_buy)
+float BUY_accel_pct = accel_pct(AOI_buy)
+
+float SELL_accel     = accel(AOI_sell)
+float SELL_accel_pct = accel_pct(AOI_sell)
+
+float ACT_accel     = accel(AOI_activity)
+float ACT_accel_pct = accel_pct(AOI_activity)
+
+float PR_accel     = accel(Pressure_used)
+float PR_accel_pct = accel_pct(Pressure_used)
+
+float ABS_accel     = accel(AbsMetric)
+float ABS_accel_pct = accel_pct(AbsMetric)
+
+float ENT_accel     = feat_entropy ? accel(EntropyH) : na
+float ENT_accel_pct = feat_entropy ? accel_pct(EntropyH) : na
+
+float TTT_accel     = feat_ttt ? accel(TTT_sec) : na
+float TTT_accel_pct = feat_ttt ? accel_pct(TTT_sec) : na
+
+//==============================
+// Advanced Accel (Jerk/Norm/Dir)
+//==============================
+float JERK_PR  = feat_adv_accel ? jerk(Pressure_used) : na
+float NORM_PR  = feat_adv_accel ? acc_norm(Pressure_used, adv_std_len) : na
+
+float JERK_ACT = feat_adv_accel ? jerk(AOI_activity) : na
+float NORM_ACT = feat_adv_accel ? acc_norm(AOI_activity, adv_std_len) : na
+
+float JERK_ABS = feat_adv_accel ? jerk(AbsMetric) : na
+float NORM_ABS = feat_adv_accel ? acc_norm(AbsMetric, adv_std_len) : na
+
+float ACC_DIR_ACT = feat_adv_accel and not na(Pressure_used) ? float(sgn(Pressure_used)) * ACT_accel : na
+float ACC_DIR_ABS = feat_adv_accel and not na(Pressure_used) ? float(sgn(Pressure_used)) * ABS_accel : na
+
+//==============================
+// Ratios
+//==============================
+float AOI_per_vol           = (not na(vol_for_total) and vol_for_total > 0) ? (AOI_total / vol_for_total) : na
+float AOI_per_buyvol        = (not na(base.buyV) and base.buyV > 0) ? (AOI_buy / base.buyV) : na
+float AOI_per_sellvol       = (not na(base.sellV) and base.sellV > 0) ? (AOI_sell / base.sellV) : na
+float AOI_total_per_buyvol  = (not na(base.buyV) and base.buyV > 0) ? (AOI_total / base.buyV) : na
+float AOI_total_per_sellvol = (not na(base.sellV) and base.sellV > 0) ? (AOI_total / base.sellV) : na
+
+//==============================
+// Quality outputs
+//==============================
+float coverage = base.coverage
+float vr       = base.vr
+float q        = base.q
+float okf      = base.ok ? 1.0 : 0.0
+
+//==============================
+// History arrays (✅ push فقط روی کندل تایید شده برای جلوگیری از چندبار Push در realtime)
+//==============================
+var float[] H_AOI_total = array.new_float()
+var float[] H_AOI_buy   = array.new_float()
+var float[] H_AOI_sell  = array.new_float()
+var float[] H_AOI_diff  = array.new_float()
+var float[] H_act       = array.new_float()
+var float[] H_acte      = array.new_float()
+var float[] H_pr_raw    = array.new_float()
+var float[] H_pr_norm   = array.new_float()
+var float[] H_pr_used   = array.new_float()
+var float[] H_p_fast    = array.new_float()
+var float[] H_p_mid     = array.new_float()
+var float[] H_p_slow    = array.new_float()
+var float[] H_vote      = array.new_float()
+var float[] H_conv      = array.new_float()
+var float[] H_fuse      = array.new_float()
+var float[] H_tpv       = array.new_float()
+var float[] H_abs       = array.new_float()
+var float[] H_imp       = array.new_float()
+var float[] H_ent       = array.new_float()
+var float[] H_ttt       = array.new_float()
+
+var float[] H_acc_aoi   = array.new_float()
+var float[] H_accp_aoi  = array.new_float()
+var float[] H_acc_buy   = array.new_float()
+var float[] H_accp_buy  = array.new_float()
+var float[] H_acc_sell  = array.new_float()
+var float[] H_accp_sell = array.new_float()
+var float[] H_acc_act   = array.new_float()
+var float[] H_accp_act  = array.new_float()
+var float[] H_acc_pr    = array.new_float()
+var float[] H_accp_pr   = array.new_float()
+var float[] H_acc_abs   = array.new_float()
+var float[] H_accp_abs  = array.new_float()
+
+var float[] H_acc_ent   = array.new_float()
+var float[] H_acc_ttt   = array.new_float()
+var float[] H_accp_ent  = array.new_float()
+var float[] H_accp_ttt  = array.new_float()
+
+var float[] H_j_pr      = array.new_float()
+var float[] H_n_pr      = array.new_float()
+var float[] H_j_act     = array.new_float()
+var float[] H_n_act     = array.new_float()
+var float[] H_j_abs     = array.new_float()
+var float[] H_n_abs     = array.new_float()
+var float[] H_dir_act   = array.new_float()
+var float[] H_dir_abs   = array.new_float()
+
+var float[] H_cov       = array.new_float()
+var float[] H_vr        = array.new_float()
+var float[] H_q         = array.new_float()
+var float[] H_ok        = array.new_float()
+
+var float[] H_r1        = array.new_float()
+var float[] H_r2        = array.new_float()
+var float[] H_r3        = array.new_float()
+var float[] H_r4        = array.new_float()
+var float[] H_r5        = array.new_float()
+
+push_hist(float[] a, float v) => array.push(a, v)
+
+trim_history() =>
+    int LIM = 5000
+    if array.size(arr_time) > LIM
+        array.shift(arr_time)
+
+        array.shift(H_AOI_total)
+        array.shift(H_AOI_buy)
+        array.shift(H_AOI_sell)
+        array.shift(H_AOI_diff)
+
+        array.shift(H_act)
+        array.shift(H_acte)
+
+        array.shift(H_pr_raw)
+        array.shift(H_pr_norm)
+        array.shift(H_pr_used)
+
+        array.shift(H_p_fast)
+        array.shift(H_p_mid)
+        array.shift(H_p_slow)
+
+        array.shift(H_vote)
+        array.shift(H_conv)
+        array.shift(H_fuse)
+
+        array.shift(H_tpv)
+        array.shift(H_abs)
+        array.shift(H_imp)
+
+        array.shift(H_ent)
+        array.shift(H_ttt)
+
+        array.shift(H_acc_aoi)
+        array.shift(H_accp_aoi)
+
+        array.shift(H_acc_buy)
+        array.shift(H_accp_buy)
+
+        array.shift(H_acc_sell)
+        array.shift(H_accp_sell)
+
+        array.shift(H_acc_act)
+        array.shift(H_accp_act)
+
+        array.shift(H_acc_pr)
+        array.shift(H_accp_pr)
+
+        array.shift(H_acc_abs)
+        array.shift(H_accp_abs)
+
+        array.shift(H_acc_ent)
+        array.shift(H_accp_ent)
+
+        array.shift(H_acc_ttt)
+        array.shift(H_accp_ttt)
+
+        array.shift(H_j_pr)
+        array.shift(H_n_pr)
+
+        array.shift(H_j_act)
+        array.shift(H_n_act)
+
+        array.shift(H_j_abs)
+        array.shift(H_n_abs)
+
+        array.shift(H_dir_act)
+        array.shift(H_dir_abs)
+
+        array.shift(H_cov)
+        array.shift(H_vr)
+        array.shift(H_q)
+        array.shift(H_ok)
+
+        array.shift(H_r1)
+        array.shift(H_r2)
+        array.shift(H_r3)
+        array.shift(H_r4)
+        array.shift(H_r5)
+
+// ✅ push فقط روی کندل تایید شده
+if barstate.isconfirmed
+    array.push(arr_time, time)
+    push_hist(H_AOI_total, AOI_total)
+    push_hist(H_AOI_buy, AOI_buy)
+    push_hist(H_AOI_sell, AOI_sell)
+    push_hist(H_AOI_diff, AOI_diff)
+    push_hist(H_act, AOI_activity)
+    push_hist(H_acte, AOI_activity_ema)
+
+    push_hist(H_pr_raw, Pressure_raw)
+    push_hist(H_pr_norm, Pressure_norm)
+    push_hist(H_pr_used, Pressure_used)
+
+    push_hist(H_p_fast, P_fast)
+    push_hist(H_p_mid,  P_mid)
+    push_hist(H_p_slow, P_slow)
+
+    push_hist(H_vote, Vote)
+    push_hist(H_conv, Conviction)
+    push_hist(H_fuse, Pressure_fused)
+
+    push_hist(H_tpv, TPV)
+    push_hist(H_abs, AbsMetric)
+    push_hist(H_imp, FlowImpedance)
+
+    push_hist(H_ent, EntropyH)
+    push_hist(H_ttt, TTT_sec)
+
+    push_hist(H_acc_aoi,  AOI_accel)
+    push_hist(H_accp_aoi, AOI_accel_pct)
+    push_hist(H_acc_buy,  BUY_accel)
+    push_hist(H_accp_buy, BUY_accel_pct)
+    push_hist(H_acc_sell, SELL_accel)
+    push_hist(H_accp_sell, SELL_accel_pct)
+    push_hist(H_acc_act,  ACT_accel)
+    push_hist(H_accp_act, ACT_accel_pct)
+    push_hist(H_acc_pr,   PR_accel)
+    push_hist(H_accp_pr,  PR_accel_pct)
+    push_hist(H_acc_abs,  ABS_accel)
+    push_hist(H_accp_abs, ABS_accel_pct)
+
+    push_hist(H_acc_ent, ENT_accel)
+    push_hist(H_acc_ttt, TTT_accel)
+    push_hist(H_accp_ent, feat_entropy ? ENT_accel_pct : na)
+    push_hist(H_accp_ttt, feat_ttt ? TTT_accel_pct : na)
+
+    push_hist(H_j_pr,  JERK_PR)
+    push_hist(H_n_pr,  NORM_PR)
+    push_hist(H_j_act, JERK_ACT)
+    push_hist(H_n_act, NORM_ACT)
+    push_hist(H_j_abs, JERK_ABS)
+    push_hist(H_n_abs, NORM_ABS)
+    push_hist(H_dir_act, ACC_DIR_ACT)
+    push_hist(H_dir_abs, ACC_DIR_ABS)
+
+    push_hist(H_cov, coverage)
+    push_hist(H_vr,  vr)
+    push_hist(H_q,   q)
+    push_hist(H_ok,  okf)
+
+    push_hist(H_r1, AOI_per_vol)
+    push_hist(H_r2, AOI_per_buyvol)
+    push_hist(H_r3, AOI_per_sellvol)
+    push_hist(H_r4, AOI_total_per_buyvol)
+    push_hist(H_r5, AOI_total_per_sellvol)
+
+    trim_history()
+
+metric_arr(string k) =>
+    float[] out = H_abs
+    if k == "AOI_total"
+        out := H_AOI_total
+    else if k == "AOI_buy"
+        out := H_AOI_buy
+    else if k == "AOI_sell"
+        out := H_AOI_sell
+    else if k == "AOI_diff"
+        out := H_AOI_diff
+    else if k == "AOI_activity"
+        out := H_act
+    else if k == "AOI_activity_ema"
+        out := H_acte
+    else if k == "Pressure_raw"
+        out := H_pr_raw
+    else if k == "Pressure_norm"
+        out := H_pr_norm
+    else if k == "Pressure_used"
+        out := H_pr_used
+    else if k == "P_fast"
+        out := H_p_fast
+    else if k == "P_mid"
+        out := H_p_mid
+    else if k == "P_slow"
+        out := H_p_slow
+    else if k == "Vote"
+        out := H_vote
+    else if k == "Conviction"
+        out := H_conv
+    else if k == "Fusion"
+        out := H_fuse
+    else if k == "TPV"
+        out := H_tpv
+    else if k == "AbsMetric"
+        out := H_abs
+    else if k == "Impedance"
+        out := H_imp
+    else if k == "Entropy"
+        out := H_ent
+    else if k == "TTT_sec"
+        out := H_ttt
+    else if k == "acc_AOI_total"
+        out := H_acc_aoi
+    else if k == "acc%_AOI_total"
+        out := H_accp_aoi
+    else if k == "acc_AOI_buy"
+        out := H_acc_buy
+    else if k == "acc%_AOI_buy"
+        out := H_accp_buy
+    else if k == "acc_AOI_sell"
+        out := H_acc_sell
+    else if k == "acc%_AOI_sell"
+        out := H_accp_sell
+    else if k == "acc_Activity"
+        out := H_acc_act
+    else if k == "acc%_Activity"
+        out := H_accp_act
+    else if k == "acc_P_used"
+        out := H_acc_pr
+    else if k == "acc%_P_used"
+        out := H_accp_pr
+    else if k == "acc_Abs"
+        out := H_acc_abs
+    else if k == "acc%_Abs"
+        out := H_accp_abs
+    else if k == "acc_Entropy"
+        out := H_acc_ent
+    else if k == "acc_TTT"
+        out := H_acc_ttt
+    else if k == "acc%_Entropy"
+        out := H_accp_ent
+    else if k == "acc%_TTT"
+        out := H_accp_ttt
+    else if k == "Jerk_PR"
+        out := H_j_pr
+    else if k == "Norm_PR"
+        out := H_n_pr
+    else if k == "Jerk_ACT"
+        out := H_j_act
+    else if k == "Norm_ACT"
+        out := H_n_act
+    else if k == "Jerk_ABS"
+        out := H_j_abs
+    else if k == "Norm_ABS"
+        out := H_n_abs
+    else if k == "acc_dir_ACT"
+        out := H_dir_act
+    else if k == "acc_dir_ABS"
+        out := H_dir_abs
+    else if k == "coverage"
+        out := H_cov
+    else if k == "vr"
+        out := H_vr
+    else if k == "q"
+        out := H_q
+    else if k == "ok"
+        out := H_ok
+    else if k == "AOI_per_vol"
+        out := H_r1
+    else if k == "AOI_per_buyvol"
+        out := H_r2
+    else if k == "AOI_per_sellvol"
+        out := H_r3
+    else if k == "AOI_total_per_buyvol"
+        out := H_r4
+    else if k == "AOI_total_per_sellvol"
+        out := H_r5
+    out
+
+//==============================
+// UI + SLOTS + TABLES + LABELS + PLOTS
+//==============================
+bool show_live_label  = input.bool(true,  "Show Live Label", group=grpUI)
+string live_lbl_pos   = input.string("Top Right", "Live Label Position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right"], group=grpUI)
+string live_lbl_size  = input.string("Small", "Live Label Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group=grpUI)
+int    live_lbl_xoff  = input.int(0, "Live Label X offset (bars)", minval=-500, maxval=500, group=grpUI)
+float  live_lbl_yoff  = input.float(0.0, "Live Label Y offset (price units)", step=0.1, group=grpUI)
+
+bool show_table       = input.bool(true,  "Show Summary Table", group=grpUI)
+string tbl_pos_str    = input.string("Bottom Right", "Table Position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right"], group=grpUI)
+string tbl_text_size  = input.string("Small", "Table Text Size", options=["Tiny", "Small", "Normal", "Large"], group=grpUI)
+int    tbl_transp     = input.int(70, "Table Background Transparency", minval=0, maxval=100, group=grpUI)
+
+// Slots
+int slots_count = input.int(8, "How many slots to show", minval=0, maxval=12, group=grpSlots)
+
+string slot1  = input.string("AOI_total",        "Slot 1",  options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpSlots)
+string slot2  = input.string("Pressure_used",    "Slot 2",  options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpSlots)
+string slot3  = input.string("Vote",             "Slot 3",  options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpSlots)
+string slot4  = input.string("Conviction",       "Slot 4",  options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpSlots)
+string slot5  = input.string("AbsMetric",        "Slot 5",  options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpSlots)
+string slot6  = input.string("AOI_activity_ema", "Slot 6",  options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpSlots)
+string slot7  = input.string("coverage",         "Slot 7",  options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpSlots)
+string slot8  = input.string("q",                "Slot 8",  options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpSlots)
+string slot9  = input.string("vr",               "Slot 9",  options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpSlots)
+string slot10 = input.string("ok",               "Slot 10", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpSlots)
+string slot11 = input.string("acc_P_used",       "Slot 11", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpSlots)
+string slot12 = input.string("Norm_PR",          "Slot 12", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpSlots)
+
+bool show_quality_block = input.bool(true, "Show Quality Block (coverage/vr/q/ok)", group=grpFeat)
+bool show_tf_block      = input.bool(true, "Show TF Block (chart/ltf/mtf)", group=grpFeat)
+bool show_core_block    = input.bool(true, "Show Core Block (AOI/Pressure/Vote)", group=grpFeat)
+
+// Plots
+bool plot_pressure  = input.bool(false, "Plot Pressure_used", group=grpPlots)
+bool plot_aoi_total = input.bool(false, "Plot AOI_total", group=grpPlots)
+bool plot_absmetric = input.bool(false, "Plot AbsMetric", group=grpPlots)
+bool plot_activity  = input.bool(false, "Plot AOI_activity_ema", group=grpPlots)
+
+// UI helpers
+pos_from_str(string s) =>
+    s == "Top Left" ? position.top_left :
+     s == "Top Right" ? position.top_right :
+     s == "Bottom Left" ? position.bottom_left :
+     position.bottom_right
+
+size_from_str(string s) =>
+    s == "Tiny" ? size.tiny :
+     s == "Small" ? size.small :
+     s == "Normal" ? size.normal :
+     s == "Large" ? size.large :
+     size.huge
+
+tbl_size_from_str(string s) =>
+    s == "Tiny" ? size.tiny :
+     s == "Small" ? size.small :
+     s == "Normal" ? size.normal :
+     size.large
+
+metric_current(string k) =>
+    float v = na
+    if k == "AOI_total"
+        v := AOI_total
+    else if k == "AOI_buy"
+        v := AOI_buy
+    else if k == "AOI_sell"
+        v := AOI_sell
+    else if k == "AOI_diff"
+        v := AOI_diff
+    else if k == "AOI_activity"
+        v := AOI_activity
+    else if k == "AOI_activity_ema"
+        v := AOI_activity_ema
+    else if k == "Pressure_raw"
+        v := Pressure_raw
+    else if k == "Pressure_norm"
+        v := Pressure_norm
+    else if k == "Pressure_used"
+        v := Pressure_used
+    else if k == "P_fast"
+        v := P_fast
+    else if k == "P_mid"
+        v := P_mid
+    else if k == "P_slow"
+        v := P_slow
+    else if k == "Vote"
+        v := Vote
+    else if k == "Conviction"
+        v := Conviction
+    else if k == "Fusion"
+        v := Pressure_fused
+    else if k == "TPV"
+        v := TPV
+    else if k == "AbsMetric"
+        v := AbsMetric
+    else if k == "Impedance"
+        v := FlowImpedance
+    else if k == "Entropy"
+        v := EntropyH
+    else if k == "TTT_sec"
+        v := TTT_sec
+    else if k == "acc_AOI_total"
+        v := AOI_accel
+    else if k == "acc%_AOI_total"
+        v := AOI_accel_pct
+    else if k == "acc_AOI_buy"
+        v := BUY_accel
+    else if k == "acc%_AOI_buy"
+        v := BUY_accel_pct
+    else if k == "acc_AOI_sell"
+        v := SELL_accel
+    else if k == "acc%_AOI_sell"
+        v := SELL_accel_pct
+    else if k == "acc_Activity"
+        v := ACT_accel
+    else if k == "acc%_Activity"
+        v := ACT_accel_pct
+    else if k == "acc_P_used"
+        v := PR_accel
+    else if k == "acc%_P_used"
+        v := PR_accel_pct
+    else if k == "acc_Abs"
+        v := ABS_accel
+    else if k == "acc%_Abs"
+        v := ABS_accel_pct
+    else if k == "acc_Entropy"
+        v := ENT_accel
+    else if k == "acc%_Entropy"
+        v := ENT_accel_pct
+    else if k == "acc_TTT"
+        v := TTT_accel
+    else if k == "acc%_TTT"
+        v := TTT_accel_pct
+    else if k == "Jerk_PR"
+        v := JERK_PR
+    else if k == "Norm_PR"
+        v := NORM_PR
+    else if k == "Jerk_ACT"
+        v := JERK_ACT
+    else if k == "Norm_ACT"
+        v := NORM_ACT
+    else if k == "Jerk_ABS"
+        v := JERK_ABS
+    else if k == "Norm_ABS"
+        v := NORM_ABS
+    else if k == "acc_dir_ACT"
+        v := ACC_DIR_ACT
+    else if k == "acc_dir_ABS"
+        v := ACC_DIR_ABS
+    else if k == "coverage"
+        v := coverage
+    else if k == "vr"
+        v := vr
+    else if k == "q"
+        v := q
+    else if k == "ok"
+        v := okf
+    else if k == "AOI_per_vol"
+        v := AOI_per_vol
+    else if k == "AOI_per_buyvol"
+        v := AOI_per_buyvol
+    else if k == "AOI_per_sellvol"
+        v := AOI_per_sellvol
+    else if k == "AOI_total_per_buyvol"
+        v := AOI_total_per_buyvol
+    else if k == "AOI_total_per_sellvol"
+        v := AOI_total_per_sellvol
+    v
+
+metric_mean(string k) => mean_sel(metric_arr(k))
+metric_sum(string k)  => sum_sel(metric_arr(k))
+
+slot_pick(int i) =>
+    i == 1 ? slot1 :
+     i == 2 ? slot2 :
+     i == 3 ? slot3 :
+     i == 4 ? slot4 :
+     i == 5 ? slot5 :
+     i == 6 ? slot6 :
+     i == 7 ? slot7 :
+     i == 8 ? slot8 :
+     i == 9 ? slot9 :
+     i == 10 ? slot10 :
+     i == 11 ? slot11 :
+     slot12
+
+// Live Label
+var label liveLbl = na
+
+live_label_text() =>
+    string t = ""
+    if show_tf_block
+        t += "TFs: chart=" + timeframe.period + " | LTF=" + ltf_eff + " | MTF=" + mtf_fast + "/" + mtf_mid + "/" + mtf_slow + "\n"
+    if show_core_block
+        t += "P_used=" + fmt(Pressure_used, precision_num) + "  Vote=" + fmt(Vote, 0) + "  Conv=" + fmt(Conviction, precision_num) + "\n"
+        t += "AOI_total=" + fmt(AOI_total, precision_num) + "  Abs=" + fmt(AbsMetric, precision_num) + "  ActEMA=" + fmt(AOI_activity_ema, precision_num) + "\n"
+    if show_quality_block
+        t += "Q: cov=" + fmt(coverage, 3) + "  vr=" + fmt(vr, 3) + "  q=" + fmt(q, 3) + "  ok=" + fmt(okf, 0) + "\n"
+
+    int sc = slots_count
+    if sc > 0
+        t += "— Slots —\n"
+        for i = 1 to 12
+            if i <= sc
+                string k = slot_pick(i)
+                float v = metric_current(k)
+                t += str.tostring(i) + ") " + k + " = " + fmt(v, precision_num) + "\n"
+    t
+
+live_label_y() =>
+    float y = (live_lbl_pos == "Bottom Left" or live_lbl_pos == "Bottom Right") ? low : high
+    y + live_lbl_yoff
+
+live_label_x() => bar_index + live_lbl_xoff
+
+label_color_from_pressure() =>
+    color c = color.new(color.gray, 0)
+    if not na(Pressure_used)
+        c := Pressure_used > 0 ? color.new(color.lime, 0) : Pressure_used < 0 ? color.new(color.red, 0) : color.new(color.gray, 0)
+    c
+
+if barstate.islast
+    if show_live_label
+        if na(liveLbl)
+            liveLbl := label.new(
+                 x=live_label_x(), y=live_label_y(),
+                 text=live_label_text(),
+                 xloc=xloc.bar_index, yloc=yloc.price,
+                 style=(live_lbl_pos == "Top Left" or live_lbl_pos == "Bottom Left") ? label.style_label_left : label.style_label_right,
+                 textcolor=color.white,
+                 color=color.new(label_color_from_pressure(), 65),
+                 size=size_from_str(live_lbl_size)
+            )
+        else
+            label.set_x(liveLbl, live_label_x())
+            label.set_y(liveLbl, live_label_y())
+            label.set_text(liveLbl, live_label_text())
+            label.set_color(liveLbl, color.new(label_color_from_pressure(), 65))
+            label.set_textcolor(liveLbl, color.white)
+            label.set_size(liveLbl, size_from_str(live_lbl_size))
+    else
+        if not na(liveLbl)
+            label.delete(liveLbl)
+            liveLbl := na
+
+// Summary Table
+var table tbl = na
+int tbl_cols = 4
+int tbl_rows = 14  // header + (win row) + 12 slots
+
+table_set_cell(table t, int col, int row, string txt, bool isHead) =>
+    int bgT = isHead ? int(math.min(90.0, float(tbl_transp + 10))) : tbl_transp
+    color bg = color.new(color.black, bgT)
+    color fg = isHead ? color.white : color.new(color.white, 0)
+    table.cell(t, col, row, txt, text_color=fg, bgcolor=bg, text_size=tbl_size_from_str(tbl_text_size))
+
+table_update(table t) =>
+    table_set_cell(t, 0, 0, "AOI Summary (" + summary_mode + ")", true)
+    table_set_cell(t, 1, 0, "Current", true)
+    table_set_cell(t, 2, 0, "Mean", true)
+    table_set_cell(t, 3, 0, "Sum", true)
+
+    string winTxt = "All loaded bars"
+    if summary_mode == "Time range"
+        winTxt := "From " + str.format("{0,date,yyyy-MM-dd HH:mm}", from_datetime) + " to " + str.format("{0,date,yyyy-MM-dd HH:mm}", to_datetime)
+    else if summary_mode == "Last N"
+        winTxt := "Last N = " + str.tostring(N_last_bars_tbl)
+
+    table_set_cell(t, 0, 1, winTxt, true)
+    table_set_cell(t, 1, 1, "LTF ok=" + fmt(okf, 0), true)
+    table_set_cell(t, 2, 1, "q=" + fmt(q, 3), true)
+    table_set_cell(t, 3, 1, "vr=" + fmt(vr, 3), true)
+
+    for i = 1 to 12
+        int r = 1 + i
+        if i <= slots_count
+            string k = slot_pick(i)
+            float cur = metric_current(k)
+            float mn  = metric_mean(k)
+            float sm  = metric_sum(k)
+
+            color rowBg = color.new(color.black, tbl_transp)
+            if k == "Pressure_used" or k == "Pressure_norm" or k == "P_fast" or k == "P_mid" or k == "P_slow" or k == "Fusion"
+                if not na(cur)
+                    rowBg := cur > 0 ? color.new(color.lime, 85) : cur < 0 ? color.new(color.red, 85) : color.new(color.gray, 85)
+
+            table.cell(t, 0, r, str.tostring(i) + ") " + k, text_color=color.white, bgcolor=rowBg, text_size=tbl_size_from_str(tbl_text_size))
+            table.cell(t, 1, r, fmt(cur, precision_num), text_color=color.white, bgcolor=rowBg, text_size=tbl_size_from_str(tbl_text_size))
+            table.cell(t, 2, r, fmt(mn,  precision_num), text_color=color.white, bgcolor=rowBg, text_size=tbl_size_from_str(tbl_text_size))
+            table.cell(t, 3, r, fmt(sm,  precision_num), text_color=color.white, bgcolor=rowBg, text_size=tbl_size_from_str(tbl_text_size))
+        else
+            table.cell(t, 0, r, "", bgcolor=color.new(color.black, 100))
+            table.cell(t, 1, r, "", bgcolor=color.new(color.black, 100))
+            table.cell(t, 2, r, "", bgcolor=color.new(color.black, 100))
+            table.cell(t, 3, r, "", bgcolor=color.new(color.black, 100))
+
+if barstate.islast
+    if show_table
+        if na(tbl)
+            tbl := table.new(pos_from_str(tbl_pos_str), tbl_cols, tbl_rows, border_width=1)
+        table_update(tbl)
+    else
+        if not na(tbl)
+            table.delete(tbl)
+            tbl := na
+
+// Plots
+plot(plot_pressure  ? Pressure_used    : na, title="Pressure_used")
+plot(plot_aoi_total ? AOI_total        : na, title="AOI_total")
+plot(plot_absmetric ? AbsMetric        : na, title="AbsMetric")
+plot(plot_activity  ? AOI_activity_ema : na, title="ActEMA")
+
+//==============================
+// Alerts Builder (20 rules)
+//==============================
+string grpAB0 = "AOI Alerts Builder • Global"
+
+bool   ab_enable              = input.bool(true,  "Enable Alerts Builder", group=grpAB0)
+bool   ab_gate_ok             = input.bool(false, "Gate signals by ok=1", group=grpAB0)
+float  ab_gate_qmin           = input.float(0.0,  "Min q (0=off)", step=0.05, group=grpAB0)
+float  ab_gate_covmin         = input.float(0.0,  "Min coverage (0=off)", step=0.05, group=grpAB0)
+
+bool   ab_use_alertcondition  = input.bool(true,  "Create alertcondition() for each rule", group=grpAB0)
+bool   ab_use_alert_function  = input.bool(true,  "Use alert() with dynamic message", group=grpAB0)
+string ab_alert_freq_str      = input.string("Once Per Bar Close", "alert() frequency", options=["Once Per Bar Close","Once Per Bar","All"], group=grpAB0)
+
+int    ab_line_len_bars       = input.int(25, "Signal Line Length (bars)", minval=1, maxval=500, group=grpAB0)
+
+// Helpers (Alerts)
+ab_fmt(float v) => na(v) ? "na" : str.tostring(v, format.mintick)
+
+ab_alert_freq() =>
+    ab_alert_freq_str == "All" ? alert.freq_all :
+     ab_alert_freq_str == "Once Per Bar" ? alert.freq_once_per_bar :
+     alert.freq_once_per_bar_close
+
+ab_anchor_price(string src) =>
+    src == "High" ? high :
+     src == "Low" ? low :
+     src == "HL2" ? hl2 :
+     src == "OHLC4" ? ohlc4 :
+     close
+
+ab_label_style(string s) =>
+    s == "Up" ? label.style_label_up :
+     s == "Down" ? label.style_label_down :
+     s == "Left" ? label.style_label_left :
+     s == "Right" ? label.style_label_right :
+     (close >= open ? label.style_label_up : label.style_label_down)
+
+ab_base(string mode, float v, float ref, float th1, float th2) =>
+    bool cross_up = ta.crossover(v, ref)
+    bool cross_dn = ta.crossunder(v, ref)
+    float chg = ta.change(v)
+    bool b = false
+    if na(v)
+        b := false
+    else
+        if mode == "Above"
+            b := not na(ref) and v > ref
+        else if mode == "Below"
+            b := not na(ref) and v < ref
+        else if mode == "Cross Up"
+            b := not na(ref) and cross_up
+        else if mode == "Cross Down"
+            b := not na(ref) and cross_dn
+        else if mode == "Inside Range"
+            b := v >= th1 and v <= th2
+        else if mode == "Outside Range"
+            b := v < th1 or v > th2
+        else if mode == "Rising"
+            b := (not na(chg)) and (chg > 0)
+        else if mode == "Falling"
+            b := (not na(chg)) and (chg < 0)
+        else
+            b := false
+    b
+
+// ✅ Pine v6 FIX: bool values are strict (never na). Use bar_index guard for prev.
+ab_edge(bool state, string edgeMode) =>
+    bool prev = bar_index > 0 ? state[1] : false
+    bool cur  = state
+    bool trig = cur
+    if edgeMode == "Rising Edge"
+        trig := cur and not prev
+    else if edgeMode == "Falling Edge"
+        trig := (not cur) and prev
+    else if edgeMode == "Any Edge"
+        trig := cur != prev
+    else
+        trig := cur
+    trig
+
+bool ab_gate_ok_pass  = not ab_gate_ok or (okf >= 1)
+bool ab_gate_q_pass   = (ab_gate_qmin <= 0) or (q >= ab_gate_qmin)
+bool ab_gate_cov_pass = (ab_gate_covmin <= 0) or (coverage >= ab_gate_covmin)
+
+bool ab_global_gate = ab_enable and ab_gate_ok_pass and ab_gate_q_pass and ab_gate_cov_pass
+
+// init label/line arrays safely
+var label[] ab_lbls = array.new_label()
+var line[]  ab_lns  = array.new_line()
+if barstate.isfirst
+    label naLbl = na
+    line  naLn  = na
+    for i = 0 to 19
+        array.push(ab_lbls, naLbl)
+        array.push(ab_lns,  naLn)
+
+ab_clear(int idx, bool clearLbl, bool clearLn) =>
+    if clearLbl
+        label oldLbl = array.get(ab_lbls, idx)
+        if not na(oldLbl)
+            label.delete(oldLbl)
+        array.set(ab_lbls, idx, na)
+    if clearLn
+        line oldLn = array.get(ab_lns, idx)
+        if not na(oldLn)
+            line.delete(oldLn)
+        array.set(ab_lns, idx, na)
+
+ab_emit(int idx, bool trig, bool drawLbl, bool drawLn, string priceSrc, float yoff, color col, string textStr, string sizeStr, string styleStr) =>
+    if trig
+        float y = ab_anchor_price(priceSrc) + yoff
+
+        if drawLbl
+            label old = array.get(ab_lbls, idx)
+            if not na(old)
+                label.delete(old)
+            label nl = label.new(bar_index, y, textStr, xloc=xloc.bar_index, yloc=yloc.price,
+                 style=ab_label_style(styleStr),
+                 size=size_from_str(sizeStr),
+                 color=color.new(col, 0),
+                 textcolor=color.white)
+            array.set(ab_lbls, idx, nl)
+
+        if drawLn
+            line oldL = array.get(ab_lns, idx)
+            if not na(oldL)
+                line.delete(oldL)
+            line nl2 = line.new(bar_index, y, bar_index + ab_line_len_bars, y,
+                 xloc=xloc.bar_index, extend=extend.none, color=col, width=1)
+            array.set(ab_lns, idx, nl2)
+
+ab_do_alert(bool trig, string msg) =>
+    if ab_use_alert_function and trig
+        alert(msg, ab_alert_freq())
+
+ab_rule_run(int idx, bool on, string nm, string met, string cmp, string mode, float th1, float th2, string met2, float off, string edge, bool confirm,
+            bool drawLbl, bool drawLn, string priceSrc, float yoff, color col, string lblSize, string styleStr, string codeShort, string codeLong) =>
+    if not on
+        ab_clear(idx, true, true)
+    else
+        if not drawLbl
+            ab_clear(idx, true, false)
+        if not drawLn
+            ab_clear(idx, false, true)
+
+    float v   = metric_current(met)
+    float ref = cmp == "Threshold" ? th1 : (metric_current(met2) + off)
+    bool  st  = ab_base(mode, v, ref, th1, th2)
+    bool  ev  = (mode == "Cross Up" or mode == "Cross Down") ? st : ab_edge(st, edge)
+    bool  tr  = ab_global_gate and on and (confirm ? barstate.isconfirmed : true) and ev
+
+    string lblTxt = codeShort + " • " + nm + "\n" + met + "=" + ab_fmt(v)
+    string msg    = "AOI Alerts Builder\n" + codeLong + ": " + nm + "\n" + syminfo.ticker + " • " + timeframe.period +
+                    "\n" + met + "=" + ab_fmt(v) +
+                    "\nMode=" + mode +
+                    ((mode == "Inside Range" or mode == "Outside Range") ? ("\nRange=[" + ab_fmt(th1) + ".." + ab_fmt(th2) + "]") : ("\nRef=" + ab_fmt(ref)))
+
+    ab_emit(idx, tr, drawLbl, drawLn, priceSrc, yoff, col, lblTxt, lblSize, styleStr)
+    ab_do_alert(tr, msg)
+    tr
+
+rule_block(int n) => "AOI Alerts • Rule " + (n < 10 ? "0" : "") + str.tostring(n)
+
+//==============================
+// RULE 01..20 (ALL GLOBAL)
+//==============================
+
+// Rule 01
+string grpR01 = rule_block(1)
+bool   r01_on        = input.bool(true,  "Enable", group=grpR01)
+string r01_name      = input.string("Pressure_used Cross Up 0", "Name", group=grpR01)
+string r01_metric    = input.string("Pressure_used", "Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR01)
+string r01_cmp       = input.string("Threshold", "Compare To", options=["Threshold","Metric"], group=grpR01)
+string r01_mode      = input.string("Cross Up", "Mode", options=["Above","Below","Cross Up","Cross Down","Inside Range","Outside Range","Rising","Falling"], group=grpR01)
+float  r01_th1       = input.float(0.0, "Threshold / Min", group=grpR01)
+float  r01_th2       = input.float(1.0, "Max (range)", group=grpR01)
+string r01_metric2   = input.string("AOI_total", "Compare Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR01)
+float  r01_off       = input.float(0.0, "Compare Offset (+/-)", step=0.1, group=grpR01)
+string r01_edge      = input.string("Rising Edge", "Trigger", options=["Rising Edge","Falling Edge","Any Edge","On True"], group=grpR01)
+bool   r01_confirm   = input.bool(true, "Confirm on bar close", group=grpR01)
+bool   r01_drawLbl   = input.bool(true, "Draw Label", group=grpR01)
+bool   r01_drawLine  = input.bool(false,"Draw Line", group=grpR01)
+string r01_priceSrc  = input.string("Close","Price Anchor", options=["Close","High","Low","HL2","OHLC4"], group=grpR01)
+float  r01_yoff      = input.float(0.0, "Price Y offset", step=0.1, group=grpR01)
+color  r01_col       = input.color(color.new(color.lime, 0), "Color", group=grpR01)
+string r01_lblSize   = input.string("Small","Label Size", options=["Tiny","Small","Normal","Large","Huge"], group=grpR01)
+string r01_lblStyle  = input.string("Auto", "Label Style", options=["Auto","Up","Down","Left","Right"], group=grpR01)
+
+bool r01_trig = ab_rule_run(0, r01_on, r01_name, r01_metric, r01_cmp, r01_mode, r01_th1, r01_th2, r01_metric2, r01_off, r01_edge, r01_confirm,
+                            r01_drawLbl, r01_drawLine, r01_priceSrc, r01_yoff, r01_col, r01_lblSize, r01_lblStyle, "R01", "Rule 01")
+alertcondition(ab_use_alertcondition and r01_trig, title="AOI AB Rule 01", message="AOI Alerts Builder - Rule 01 fired")
+
+// Rule 02
+string grpR02 = rule_block(2)
+bool   r02_on        = input.bool(true,  "Enable", group=grpR02)
+string r02_name      = input.string("Pressure_used Cross Down 0", "Name", group=grpR02)
+string r02_metric    = input.string("Pressure_used", "Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR02)
+string r02_cmp       = input.string("Threshold", "Compare To", options=["Threshold","Metric"], group=grpR02)
+string r02_mode      = input.string("Cross Down", "Mode", options=["Above","Below","Cross Up","Cross Down","Inside Range","Outside Range","Rising","Falling"], group=grpR02)
+float  r02_th1       = input.float(0.0, "Threshold / Min", group=grpR02)
+float  r02_th2       = input.float(1.0, "Max (range)", group=grpR02)
+string r02_metric2   = input.string("AOI_total", "Compare Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR02)
+float  r02_off       = input.float(0.0, "Compare Offset (+/-)", step=0.1, group=grpR02)
+string r02_edge      = input.string("Rising Edge", "Trigger", options=["Rising Edge","Falling Edge","Any Edge","On True"], group=grpR02)
+bool   r02_confirm   = input.bool(true, "Confirm on bar close", group=grpR02)
+bool   r02_drawLbl   = input.bool(true, "Draw Label", group=grpR02)
+bool   r02_drawLine  = input.bool(false,"Draw Line", group=grpR02)
+string r02_priceSrc  = input.string("Close","Price Anchor", options=["Close","High","Low","HL2","OHLC4"], group=grpR02)
+float  r02_yoff      = input.float(0.0, "Price Y offset", step=0.1, group=grpR02)
+color  r02_col       = input.color(color.new(color.red, 0), "Color", group=grpR02)
+string r02_lblSize   = input.string("Small","Label Size", options=["Tiny","Small","Normal","Large","Huge"], group=grpR02)
+string r02_lblStyle  = input.string("Auto", "Label Style", options=["Auto","Up","Down","Left","Right"], group=grpR02)
+
+bool r02_trig = ab_rule_run(1, r02_on, r02_name, r02_metric, r02_cmp, r02_mode, r02_th1, r02_th2, r02_metric2, r02_off, r02_edge, r02_confirm,
+                            r02_drawLbl, r02_drawLine, r02_priceSrc, r02_yoff, r02_col, r02_lblSize, r02_lblStyle, "R02", "Rule 02")
+alertcondition(ab_use_alertcondition and r02_trig, title="AOI AB Rule 02", message="AOI Alerts Builder - Rule 02 fired")
+
+// Rule 03
+string grpR03 = rule_block(3)
+bool   r03_on        = input.bool(true,  "Enable", group=grpR03)
+string r03_name      = input.string("Vote Cross Up 0", "Name", group=grpR03)
+string r03_metric    = input.string("Vote", "Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR03)
+string r03_cmp       = input.string("Threshold", "Compare To", options=["Threshold","Metric"], group=grpR03)
+string r03_mode      = input.string("Cross Up", "Mode", options=["Above","Below","Cross Up","Cross Down","Inside Range","Outside Range","Rising","Falling"], group=grpR03)
+float  r03_th1       = input.float(0.0, "Threshold / Min", group=grpR03)
+float  r03_th2       = input.float(1.0, "Max (range)", group=grpR03)
+string r03_metric2   = input.string("AOI_total", "Compare Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR03)
+float  r03_off       = input.float(0.0, "Compare Offset (+/-)", step=0.1, group=grpR03)
+string r03_edge      = input.string("Rising Edge", "Trigger", options=["Rising Edge","Falling Edge","Any Edge","On True"], group=grpR03)
+bool   r03_confirm   = input.bool(true, "Confirm on bar close", group=grpR03)
+bool   r03_drawLbl   = input.bool(true, "Draw Label", group=grpR03)
+bool   r03_drawLine  = input.bool(false,"Draw Line", group=grpR03)
+string r03_priceSrc  = input.string("Close","Price Anchor", options=["Close","High","Low","HL2","OHLC4"], group=grpR03)
+float  r03_yoff      = input.float(0.0, "Price Y offset", step=0.1, group=grpR03)
+color  r03_col       = input.color(color.new(color.teal, 0), "Color", group=grpR03)
+string r03_lblSize   = input.string("Small","Label Size", options=["Tiny","Small","Normal","Large","Huge"], group=grpR03)
+string r03_lblStyle  = input.string("Auto", "Label Style", options=["Auto","Up","Down","Left","Right"], group=grpR03)
+
+bool r03_trig = ab_rule_run(2, r03_on, r03_name, r03_metric, r03_cmp, r03_mode, r03_th1, r03_th2, r03_metric2, r03_off, r03_edge, r03_confirm,
+                            r03_drawLbl, r03_drawLine, r03_priceSrc, r03_yoff, r03_col, r03_lblSize, r03_lblStyle, "R03", "Rule 03")
+alertcondition(ab_use_alertcondition and r03_trig, title="AOI AB Rule 03", message="AOI Alerts Builder - Rule 03 fired")
+
+// Rule 04
+string grpR04 = rule_block(4)
+bool   r04_on        = input.bool(true,  "Enable", group=grpR04)
+string r04_name      = input.string("Vote Cross Down 0", "Name", group=grpR04)
+string r04_metric    = input.string("Vote", "Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR04)
+string r04_cmp       = input.string("Threshold", "Compare To", options=["Threshold","Metric"], group=grpR04)
+string r04_mode      = input.string("Cross Down", "Mode", options=["Above","Below","Cross Up","Cross Down","Inside Range","Outside Range","Rising","Falling"], group=grpR04)
+float  r04_th1       = input.float(0.0, "Threshold / Min", group=grpR04)
+float  r04_th2       = input.float(1.0, "Max (range)", group=grpR04)
+string r04_metric2   = input.string("AOI_total", "Compare Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR04)
+float  r04_off       = input.float(0.0, "Compare Offset (+/-)", step=0.1, group=grpR04)
+string r04_edge      = input.string("Rising Edge", "Trigger", options=["Rising Edge","Falling Edge","Any Edge","On True"], group=grpR04)
+bool   r04_confirm   = input.bool(true, "Confirm on bar close", group=grpR04)
+bool   r04_drawLbl   = input.bool(true, "Draw Label", group=grpR04)
+bool   r04_drawLine  = input.bool(false,"Draw Line", group=grpR04)
+string r04_priceSrc  = input.string("Close","Price Anchor", options=["Close","High","Low","HL2","OHLC4"], group=grpR04)
+float  r04_yoff      = input.float(0.0, "Price Y offset", step=0.1, group=grpR04)
+color  r04_col       = input.color(color.new(color.orange, 0), "Color", group=grpR04)
+string r04_lblSize   = input.string("Small","Label Size", options=["Tiny","Small","Normal","Large","Huge"], group=grpR04)
+string r04_lblStyle  = input.string("Auto", "Label Style", options=["Auto","Up","Down","Left","Right"], group=grpR04)
+
+bool r04_trig = ab_rule_run(3, r04_on, r04_name, r04_metric, r04_cmp, r04_mode, r04_th1, r04_th2, r04_metric2, r04_off, r04_edge, r04_confirm,
+                            r04_drawLbl, r04_drawLine, r04_priceSrc, r04_yoff, r04_col, r04_lblSize, r04_lblStyle, "R04", "Rule 04")
+alertcondition(ab_use_alertcondition and r04_trig, title="AOI AB Rule 04", message="AOI Alerts Builder - Rule 04 fired")
+
+// Rule 05
+string grpR05 = rule_block(5)
+bool   r05_on        = input.bool(false, "Enable", group=grpR05)
+string r05_name      = input.string("Conviction Above 0.70 (Edge)", "Name", group=grpR05)
+string r05_metric    = input.string("Conviction", "Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR05)
+string r05_cmp       = input.string("Threshold", "Compare To", options=["Threshold","Metric"], group=grpR05)
+string r05_mode      = input.string("Above", "Mode", options=["Above","Below","Cross Up","Cross Down","Inside Range","Outside Range","Rising","Falling"], group=grpR05)
+float  r05_th1       = input.float(0.70, "Threshold / Min", group=grpR05)
+float  r05_th2       = input.float(1.0,  "Max (range)", group=grpR05)
+string r05_metric2   = input.string("AOI_total", "Compare Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR05)
+float  r05_off       = input.float(0.0,  "Compare Offset (+/-)", step=0.1, group=grpR05)
+string r05_edge      = input.string("Rising Edge", "Trigger", options=["Rising Edge","Falling Edge","Any Edge","On True"], group=grpR05)
+bool   r05_confirm   = input.bool(true,  "Confirm on bar close", group=grpR05)
+bool   r05_drawLbl   = input.bool(true, "Draw Label", group=grpR05)
+bool   r05_drawLine  = input.bool(false,"Draw Line", group=grpR05)
+string r05_priceSrc  = input.string("Close","Price Anchor", options=["Close","High","Low","HL2","OHLC4"], group=grpR05)
+float  r05_yoff      = input.float(0.0, "Price Y offset", step=0.1, group=grpR05)
+color  r05_col       = input.color(color.new(color.fuchsia, 0), "Color", group=grpR05)
+string r05_lblSize   = input.string("Small","Label Size", options=["Tiny","Small","Normal","Large","Huge"], group=grpR05)
+string r05_lblStyle  = input.string("Auto", "Label Style", options=["Auto","Up","Down","Left","Right"], group=grpR05)
+
+bool r05_trig = ab_rule_run(4, r05_on, r05_name, r05_metric, r05_cmp, r05_mode, r05_th1, r05_th2, r05_metric2, r05_off, r05_edge, r05_confirm,
+                            r05_drawLbl, r05_drawLine, r05_priceSrc, r05_yoff, r05_col, r05_lblSize, r05_lblStyle, "R05", "Rule 05")
+alertcondition(ab_use_alertcondition and r05_trig, title="AOI AB Rule 05", message="AOI Alerts Builder - Rule 05 fired")
+
+// Rule 06
+string grpR06 = rule_block(6)
+bool   r06_on        = input.bool(false, "Enable", group=grpR06)
+string r06_name      = input.string("Conviction Below 0.30 (Edge)", "Name", group=grpR06)
+string r06_metric    = input.string("Conviction", "Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR06)
+string r06_cmp       = input.string("Threshold", "Compare To", options=["Threshold","Metric"], group=grpR06)
+string r06_mode      = input.string("Below", "Mode", options=["Above","Below","Cross Up","Cross Down","Inside Range","Outside Range","Rising","Falling"], group=grpR06)
+float  r06_th1       = input.float(0.30, "Threshold / Min", group=grpR06)
+float  r06_th2       = input.float(1.0,  "Max (range)", group=grpR06)
+string r06_metric2   = input.string("AOI_total", "Compare Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR06)
+float  r06_off       = input.float(0.0,  "Compare Offset (+/-)", step=0.1, group=grpR06)
+string r06_edge      = input.string("Rising Edge", "Trigger", options=["Rising Edge","Falling Edge","Any Edge","On True"], group=grpR06)
+bool   r06_confirm   = input.bool(true,  "Confirm on bar close", group=grpR06)
+bool   r06_drawLbl   = input.bool(true, "Draw Label", group=grpR06)
+bool   r06_drawLine  = input.bool(false,"Draw Line", group=grpR06)
+string r06_priceSrc  = input.string("Close","Price Anchor", options=["Close","High","Low","HL2","OHLC4"], group=grpR06)
+float  r06_yoff      = input.float(0.0, "Price Y offset", step=0.1, group=grpR06)
+color  r06_col       = input.color(color.new(color.purple, 0), "Color", group=grpR06)
+string r06_lblSize   = input.string("Small","Label Size", options=["Tiny","Small","Normal","Large","Huge"], group=grpR06)
+string r06_lblStyle  = input.string("Auto", "Label Style", options=["Auto","Up","Down","Left","Right"], group=grpR06)
+
+bool r06_trig = ab_rule_run(5, r06_on, r06_name, r06_metric, r06_cmp, r06_mode, r06_th1, r06_th2, r06_metric2, r06_off, r06_edge, r06_confirm,
+                            r06_drawLbl, r06_drawLine, r06_priceSrc, r06_yoff, r06_col, r06_lblSize, r06_lblStyle, "R06", "Rule 06")
+alertcondition(ab_use_alertcondition and r06_trig, title="AOI AB Rule 06", message="AOI Alerts Builder - Rule 06 fired")
+
+// Rule 07
+string grpR07 = rule_block(7)
+bool   r07_on        = input.bool(false, "Enable", group=grpR07)
+string r07_name      = input.string("AOI_total Above 0 (Edge)", "Name", group=grpR07)
+string r07_metric    = input.string("AOI_total", "Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR07)
+string r07_cmp       = input.string("Threshold", "Compare To", options=["Threshold","Metric"], group=grpR07)
+string r07_mode      = input.string("Above", "Mode", options=["Above","Below","Cross Up","Cross Down","Inside Range","Outside Range","Rising","Falling"], group=grpR07)
+float  r07_th1       = input.float(0.0, "Threshold / Min", group=grpR07)
+float  r07_th2       = input.float(1.0, "Max (range)", group=grpR07)
+string r07_metric2   = input.string("Pressure_used", "Compare Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR07)
+float  r07_off       = input.float(0.0, "Compare Offset (+/-)", step=0.1, group=grpR07)
+string r07_edge      = input.string("Rising Edge", "Trigger", options=["Rising Edge","Falling Edge","Any Edge","On True"], group=grpR07)
+bool   r07_confirm   = input.bool(true, "Confirm on bar close", group=grpR07)
+bool   r07_drawLbl   = input.bool(true, "Draw Label", group=grpR07)
+bool   r07_drawLine  = input.bool(false,"Draw Line", group=grpR07)
+string r07_priceSrc  = input.string("Close","Price Anchor", options=["Close","High","Low","HL2","OHLC4"], group=grpR07)
+float  r07_yoff      = input.float(0.0, "Price Y offset", step=0.1, group=grpR07)
+color  r07_col       = input.color(color.new(color.green, 0), "Color", group=grpR07)
+string r07_lblSize   = input.string("Small","Label Size", options=["Tiny","Small","Normal","Large","Huge"], group=grpR07)
+string r07_lblStyle  = input.string("Auto", "Label Style", options=["Auto","Up","Down","Left","Right"], group=grpR07)
+
+bool r07_trig = ab_rule_run(6, r07_on, r07_name, r07_metric, r07_cmp, r07_mode, r07_th1, r07_th2, r07_metric2, r07_off, r07_edge, r07_confirm,
+                            r07_drawLbl, r07_drawLine, r07_priceSrc, r07_yoff, r07_col, r07_lblSize, r07_lblStyle, "R07", "Rule 07")
+alertcondition(ab_use_alertcondition and r07_trig, title="AOI AB Rule 07", message="AOI Alerts Builder - Rule 07 fired")
+
+// Rule 08
+string grpR08 = rule_block(8)
+bool   r08_on        = input.bool(false, "Enable", group=grpR08)
+string r08_name      = input.string("AOI_total Below 0 (Edge)", "Name", group=grpR08)
+string r08_metric    = input.string("AOI_total", "Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR08)
+string r08_cmp       = input.string("Threshold", "Compare To", options=["Threshold","Metric"], group=grpR08)
+string r08_mode      = input.string("Below", "Mode", options=["Above","Below","Cross Up","Cross Down","Inside Range","Outside Range","Rising","Falling"], group=grpR08)
+float  r08_th1       = input.float(0.0, "Threshold / Min", group=grpR08)
+float  r08_th2       = input.float(1.0, "Max (range)", group=grpR08)
+string r08_metric2   = input.string("Pressure_used", "Compare Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR08)
+float  r08_off       = input.float(0.0, "Compare Offset (+/-)", step=0.1, group=grpR08)
+string r08_edge      = input.string("Rising Edge", "Trigger", options=["Rising Edge","Falling Edge","Any Edge","On True"], group=grpR08)
+bool   r08_confirm   = input.bool(true, "Confirm on bar close", group=grpR08)
+bool   r08_drawLbl   = input.bool(true, "Draw Label", group=grpR08)
+bool   r08_drawLine  = input.bool(false,"Draw Line", group=grpR08)
+string r08_priceSrc  = input.string("Close","Price Anchor", options=["Close","High","Low","HL2","OHLC4"], group=grpR08)
+float  r08_yoff      = input.float(0.0, "Price Y offset", step=0.1, group=grpR08)
+color  r08_col       = input.color(color.new(color.red, 0), "Color", group=grpR08)
+string r08_lblSize   = input.string("Small","Label Size", options=["Tiny","Small","Normal","Large","Huge"], group=grpR08)
+string r08_lblStyle  = input.string("Auto", "Label Style", options=["Auto","Up","Down","Left","Right"], group=grpR08)
+
+bool r08_trig = ab_rule_run(7, r08_on, r08_name, r08_metric, r08_cmp, r08_mode, r08_th1, r08_th2, r08_metric2, r08_off, r08_edge, r08_confirm,
+                            r08_drawLbl, r08_drawLine, r08_priceSrc, r08_yoff, r08_col, r08_lblSize, r08_lblStyle, "R08", "Rule 08")
+alertcondition(ab_use_alertcondition and r08_trig, title="AOI AB Rule 08", message="AOI Alerts Builder - Rule 08 fired")
+
+// Rule 09
+string grpR09 = rule_block(9)
+bool   r09_on        = input.bool(false, "Enable", group=grpR09)
+string r09_name      = input.string("AbsMetric Above 1.0 (Edge)", "Name", group=grpR09)
+string r09_metric    = input.string("AbsMetric", "Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR09)
+string r09_cmp       = input.string("Threshold", "Compare To", options=["Threshold","Metric"], group=grpR09)
+string r09_mode      = input.string("Above", "Mode", options=["Above","Below","Cross Up","Cross Down","Inside Range","Outside Range","Rising","Falling"], group=grpR09)
+float  r09_th1       = input.float(1.0, "Threshold / Min", group=grpR09)
+float  r09_th2       = input.float(2.0, "Max (range)", group=grpR09)
+string r09_metric2   = input.string("AOI_total", "Compare Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR09)
+float  r09_off       = input.float(0.0, "Compare Offset (+/-)", step=0.1, group=grpR09)
+string r09_edge      = input.string("Rising Edge", "Trigger", options=["Rising Edge","Falling Edge","Any Edge","On True"], group=grpR09)
+bool   r09_confirm   = input.bool(true, "Confirm on bar close", group=grpR09)
+bool   r09_drawLbl   = input.bool(true, "Draw Label", group=grpR09)
+bool   r09_drawLine  = input.bool(false,"Draw Line", group=grpR09)
+string r09_priceSrc  = input.string("Close","Price Anchor", options=["Close","High","Low","HL2","OHLC4"], group=grpR09)
+float  r09_yoff      = input.float(0.0, "Price Y offset", step=0.1, group=grpR09)
+color  r09_col       = input.color(color.new(color.yellow, 0), "Color", group=grpR09)
+string r09_lblSize   = input.string("Small","Label Size", options=["Tiny","Small","Normal","Large","Huge"], group=grpR09)
+string r09_lblStyle  = input.string("Auto", "Label Style", options=["Auto","Up","Down","Left","Right"], group=grpR09)
+
+bool r09_trig = ab_rule_run(8, r09_on, r09_name, r09_metric, r09_cmp, r09_mode, r09_th1, r09_th2, r09_metric2, r09_off, r09_edge, r09_confirm,
+                            r09_drawLbl, r09_drawLine, r09_priceSrc, r09_yoff, r09_col, r09_lblSize, r09_lblStyle, "R09", "Rule 09")
+alertcondition(ab_use_alertcondition and r09_trig, title="AOI AB Rule 09", message="AOI Alerts Builder - Rule 09 fired")
+
+// Rule 10
+string grpR10 = rule_block(10)
+bool   r10_on        = input.bool(false, "Enable", group=grpR10)
+string r10_name      = input.string("Activity Cross Up its EMA", "Name", group=grpR10)
+string r10_metric    = input.string("AOI_activity", "Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR10)
+string r10_cmp       = input.string("Metric", "Compare To", options=["Threshold","Metric"], group=grpR10)
+string r10_mode      = input.string("Cross Up", "Mode", options=["Above","Below","Cross Up","Cross Down","Inside Range","Outside Range","Rising","Falling"], group=grpR10)
+float  r10_th1       = input.float(0.0, "Threshold / Min", group=grpR10)
+float  r10_th2       = input.float(1.0, "Max (range)", group=grpR10)
+string r10_metric2   = input.string("AOI_activity_ema", "Compare Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR10)
+float  r10_off       = input.float(0.0, "Compare Offset (+/-)", step=0.1, group=grpR10)
+string r10_edge      = input.string("Rising Edge", "Trigger", options=["Rising Edge","Falling Edge","Any Edge","On True"], group=grpR10)
+bool   r10_confirm   = input.bool(true, "Confirm on bar close", group=grpR10)
+bool   r10_drawLbl   = input.bool(true, "Draw Label", group=grpR10)
+bool   r10_drawLine  = input.bool(false,"Draw Line", group=grpR10)
+string r10_priceSrc  = input.string("Close","Price Anchor", options=["Close","High","Low","HL2","OHLC4"], group=grpR10)
+float  r10_yoff      = input.float(0.0, "Price Y offset", step=0.1, group=grpR10)
+color  r10_col       = input.color(color.new(color.aqua, 0), "Color", group=grpR10)
+string r10_lblSize   = input.string("Small","Label Size", options=["Tiny","Small","Normal","Large","Huge"], group=grpR10)
+string r10_lblStyle  = input.string("Auto", "Label Style", options=["Auto","Up","Down","Left","Right"], group=grpR10)
+
+bool r10_trig = ab_rule_run(9, r10_on, r10_name, r10_metric, r10_cmp, r10_mode, r10_th1, r10_th2, r10_metric2, r10_off, r10_edge, r10_confirm,
+                            r10_drawLbl, r10_drawLine, r10_priceSrc, r10_yoff, r10_col, r10_lblSize, r10_lblStyle, "R10", "Rule 10")
+alertcondition(ab_use_alertcondition and r10_trig, title="AOI AB Rule 10", message="AOI Alerts Builder - Rule 10 fired")
+
+// Rule 11
+string grpR11 = rule_block(11)
+bool   r11_on        = input.bool(false, "Enable", group=grpR11)
+string r11_name      = input.string("Quality ok == 1 (Edge)", "Name", group=grpR11)
+string r11_metric    = input.string("ok", "Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR11)
+string r11_cmp       = input.string("Threshold", "Compare To", options=["Threshold","Metric"], group=grpR11)
+string r11_mode      = input.string("Above", "Mode", options=["Above","Below","Cross Up","Cross Down","Inside Range","Outside Range","Rising","Falling"], group=grpR11)
+float  r11_th1       = input.float(0.5, "Threshold / Min", group=grpR11)
+float  r11_th2       = input.float(1.0, "Max (range)", group=grpR11)
+string r11_metric2   = input.string("q", "Compare Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR11)
+float  r11_off       = input.float(0.0, "Compare Offset (+/-)", step=0.1, group=grpR11)
+string r11_edge      = input.string("Rising Edge", "Trigger", options=["Rising Edge","Falling Edge","Any Edge","On True"], group=grpR11)
+bool   r11_confirm   = input.bool(true, "Confirm on bar close", group=grpR11)
+bool   r11_drawLbl   = input.bool(true, "Draw Label", group=grpR11)
+bool   r11_drawLine  = input.bool(false,"Draw Line", group=grpR11)
+string r11_priceSrc  = input.string("Close","Price Anchor", options=["Close","High","Low","HL2","OHLC4"], group=grpR11)
+float  r11_yoff      = input.float(0.0, "Price Y offset", step=0.1, group=grpR11)
+color  r11_col       = input.color(color.new(color.white, 0), "Color", group=grpR11)
+string r11_lblSize   = input.string("Small","Label Size", options=["Tiny","Small","Normal","Large","Huge"], group=grpR11)
+string r11_lblStyle  = input.string("Auto", "Label Style", options=["Auto","Up","Down","Left","Right"], group=grpR11)
+
+bool r11_trig = ab_rule_run(10, r11_on, r11_name, r11_metric, r11_cmp, r11_mode, r11_th1, r11_th2, r11_metric2, r11_off, r11_edge, r11_confirm,
+                            r11_drawLbl, r11_drawLine, r11_priceSrc, r11_yoff, r11_col, r11_lblSize, r11_lblStyle, "R11", "Rule 11")
+alertcondition(ab_use_alertcondition and r11_trig, title="AOI AB Rule 11", message="AOI Alerts Builder - Rule 11 fired")
+
+// Rule 12
+string grpR12 = rule_block(12)
+bool   r12_on        = input.bool(false, "Enable", group=grpR12)
+string r12_name      = input.string("q Above 0.60 (Edge)", "Name", group=grpR12)
+string r12_metric    = input.string("q", "Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR12)
+string r12_cmp       = input.string("Threshold", "Compare To", options=["Threshold","Metric"], group=grpR12)
+string r12_mode      = input.string("Above", "Mode", options=["Above","Below","Cross Up","Cross Down","Inside Range","Outside Range","Rising","Falling"], group=grpR12)
+float  r12_th1       = input.float(0.60, "Threshold / Min", group=grpR12)
+float  r12_th2       = input.float(1.0, "Max (range)", group=grpR12)
+string r12_metric2   = input.string("coverage", "Compare Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR12)
+float  r12_off       = input.float(0.0, "Compare Offset (+/-)", step=0.1, group=grpR12)
+string r12_edge      = input.string("Rising Edge", "Trigger", options=["Rising Edge","Falling Edge","Any Edge","On True"], group=grpR12)
+bool   r12_confirm   = input.bool(true, "Confirm on bar close", group=grpR12)
+bool   r12_drawLbl   = input.bool(true, "Draw Label", group=grpR12)
+bool   r12_drawLine  = input.bool(false,"Draw Line", group=grpR12)
+string r12_priceSrc  = input.string("Close","Price Anchor", options=["Close","High","Low","HL2","OHLC4"], group=grpR12)
+float  r12_yoff      = input.float(0.0, "Price Y offset", step=0.1, group=grpR12)
+color  r12_col       = input.color(color.new(color.blue, 0), "Color", group=grpR12)
+string r12_lblSize   = input.string("Small","Label Size", options=["Tiny","Small","Normal","Large","Huge"], group=grpR12)
+string r12_lblStyle  = input.string("Auto", "Label Style", options=["Auto","Up","Down","Left","Right"], group=grpR12)
+
+bool r12_trig = ab_rule_run(11, r12_on, r12_name, r12_metric, r12_cmp, r12_mode, r12_th1, r12_th2, r12_metric2, r12_off, r12_edge, r12_confirm,
+                            r12_drawLbl, r12_drawLine, r12_priceSrc, r12_yoff, r12_col, r12_lblSize, r12_lblStyle, "R12", "Rule 12")
+alertcondition(ab_use_alertcondition and r12_trig, title="AOI AB Rule 12", message="AOI Alerts Builder - Rule 12 fired")
+
+// Rule 13
+string grpR13 = rule_block(13)
+bool   r13_on        = input.bool(false, "Enable", group=grpR13)
+string r13_name      = input.string("coverage Above 0.60 (Edge)", "Name", group=grpR13)
+string r13_metric    = input.string("coverage", "Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR13)
+string r13_cmp       = input.string("Threshold", "Compare To", options=["Threshold","Metric"], group=grpR13)
+string r13_mode      = input.string("Above", "Mode", options=["Above","Below","Cross Up","Cross Down","Inside Range","Outside Range","Rising","Falling"], group=grpR13)
+float  r13_th1       = input.float(0.60, "Threshold / Min", group=grpR13)
+float  r13_th2       = input.float(1.0, "Max (range)", group=grpR13)
+string r13_metric2   = input.string("vr", "Compare Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR13)
+float  r13_off       = input.float(0.0, "Compare Offset (+/-)", step=0.1, group=grpR13)
+string r13_edge      = input.string("Rising Edge", "Trigger", options=["Rising Edge","Falling Edge","Any Edge","On True"], group=grpR13)
+bool   r13_confirm   = input.bool(true, "Confirm on bar close", group=grpR13)
+bool   r13_drawLbl   = input.bool(true, "Draw Label", group=grpR13)
+bool   r13_drawLine  = input.bool(false,"Draw Line", group=grpR13)
+string r13_priceSrc  = input.string("Close","Price Anchor", options=["Close","High","Low","HL2","OHLC4"], group=grpR13)
+float  r13_yoff      = input.float(0.0, "Price Y offset", step=0.1, group=grpR13)
+color  r13_col       = input.color(color.new(color.gray, 0), "Color", group=grpR13)
+string r13_lblSize   = input.string("Small","Label Size", options=["Tiny","Small","Normal","Large","Huge"], group=grpR13)
+string r13_lblStyle  = input.string("Auto", "Label Style", options=["Auto","Up","Down","Left","Right"], group=grpR13)
+
+bool r13_trig = ab_rule_run(12, r13_on, r13_name, r13_metric, r13_cmp, r13_mode, r13_th1, r13_th2, r13_metric2, r13_off, r13_edge, r13_confirm,
+                            r13_drawLbl, r13_drawLine, r13_priceSrc, r13_yoff, r13_col, r13_lblSize, r13_lblStyle, "R13", "Rule 13")
+alertcondition(ab_use_alertcondition and r13_trig, title="AOI AB Rule 13", message="AOI Alerts Builder - Rule 13 fired")
+
+// Rule 14
+string grpR14 = rule_block(14)
+bool   r14_on        = input.bool(false, "Enable", group=grpR14)
+string r14_name      = input.string("vr Above 0.60 (Edge)", "Name", group=grpR14)
+string r14_metric    = input.string("vr", "Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR14)
+string r14_cmp       = input.string("Threshold", "Compare To", options=["Threshold","Metric"], group=grpR14)
+string r14_mode      = input.string("Above", "Mode", options=["Above","Below","Cross Up","Cross Down","Inside Range","Outside Range","Rising","Falling"], group=grpR14)
+float  r14_th1       = input.float(0.60, "Threshold / Min", group=grpR14)
+float  r14_th2       = input.float(1.0, "Max (range)", group=grpR14)
+string r14_metric2   = input.string("q", "Compare Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR14)
+float  r14_off       = input.float(0.0, "Compare Offset (+/-)", step=0.1, group=grpR14)
+string r14_edge      = input.string("Rising Edge", "Trigger", options=["Rising Edge","Falling Edge","Any Edge","On True"], group=grpR14)
+bool   r14_confirm   = input.bool(true, "Confirm on bar close", group=grpR14)
+bool   r14_drawLbl   = input.bool(true, "Draw Label", group=grpR14)
+bool   r14_drawLine  = input.bool(false,"Draw Line", group=grpR14)
+string r14_priceSrc  = input.string("Close","Price Anchor", options=["Close","High","Low","HL2","OHLC4"], group=grpR14)
+float  r14_yoff      = input.float(0.0, "Price Y offset", step=0.1, group=grpR14)
+color  r14_col       = input.color(color.new(color.silver, 0), "Color", group=grpR14)
+string r14_lblSize   = input.string("Small","Label Size", options=["Tiny","Small","Normal","Large","Huge"], group=grpR14)
+string r14_lblStyle  = input.string("Auto", "Label Style", options=["Auto","Up","Down","Left","Right"], group=grpR14)
+
+bool r14_trig = ab_rule_run(13, r14_on, r14_name, r14_metric, r14_cmp, r14_mode, r14_th1, r14_th2, r14_metric2, r14_off, r14_edge, r14_confirm,
+                            r14_drawLbl, r14_drawLine, r14_priceSrc, r14_yoff, r14_col, r14_lblSize, r14_lblStyle, "R14", "Rule 14")
+alertcondition(ab_use_alertcondition and r14_trig, title="AOI AB Rule 14", message="AOI Alerts Builder - Rule 14 fired")
+
+// Rule 15
+string grpR15 = rule_block(15)
+bool   r15_on        = input.bool(false, "Enable", group=grpR15)
+string r15_name      = input.string("Entropy Falling (Edge)", "Name", group=grpR15)
+string r15_metric    = input.string("Entropy", "Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR15)
+string r15_cmp       = input.string("Threshold", "Compare To", options=["Threshold","Metric"], group=grpR15)
+string r15_mode      = input.string("Falling", "Mode", options=["Above","Below","Cross Up","Cross Down","Inside Range","Outside Range","Rising","Falling"], group=grpR15)
+float  r15_th1       = input.float(0.0, "Threshold / Min", group=grpR15)
+float  r15_th2       = input.float(1.0, "Max (range)", group=grpR15)
+string r15_metric2   = input.string("q", "Compare Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR15)
+float  r15_off       = input.float(0.0, "Compare Offset (+/-)", step=0.1, group=grpR15)
+string r15_edge      = input.string("Rising Edge", "Trigger", options=["Rising Edge","Falling Edge","Any Edge","On True"], group=grpR15)
+bool   r15_confirm   = input.bool(true, "Confirm on bar close", group=grpR15)
+bool   r15_drawLbl   = input.bool(true, "Draw Label", group=grpR15)
+bool   r15_drawLine  = input.bool(false,"Draw Line", group=grpR15)
+string r15_priceSrc  = input.string("Close","Price Anchor", options=["Close","High","Low","HL2","OHLC4"], group=grpR15)
+float  r15_yoff      = input.float(0.0, "Price Y offset", step=0.1, group=grpR15)
+color  r15_col       = input.color(color.new(color.maroon, 0), "Color", group=grpR15)
+string r15_lblSize   = input.string("Small","Label Size", options=["Tiny","Small","Normal","Large","Huge"], group=grpR15)
+string r15_lblStyle  = input.string("Auto", "Label Style", options=["Auto","Up","Down","Left","Right"], group=grpR15)
+
+bool r15_trig = ab_rule_run(14, r15_on, r15_name, r15_metric, r15_cmp, r15_mode, r15_th1, r15_th2, r15_metric2, r15_off, r15_edge, r15_confirm,
+                            r15_drawLbl, r15_drawLine, r15_priceSrc, r15_yoff, r15_col, r15_lblSize, r15_lblStyle, "R15", "Rule 15")
+alertcondition(ab_use_alertcondition and r15_trig, title="AOI AB Rule 15", message="AOI Alerts Builder - Rule 15 fired")
+
+// Rule 16
+string grpR16 = rule_block(16)
+bool   r16_on        = input.bool(false, "Enable", group=grpR16)
+string r16_name      = input.string("Impedance Rising (Edge)", "Name", group=grpR16)
+string r16_metric    = input.string("Impedance", "Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR16)
+string r16_cmp       = input.string("Threshold", "Compare To", options=["Threshold","Metric"], group=grpR16)
+string r16_mode      = input.string("Rising", "Mode", options=["Above","Below","Cross Up","Cross Down","Inside Range","Outside Range","Rising","Falling"], group=grpR16)
+float  r16_th1       = input.float(0.0, "Threshold / Min", group=grpR16)
+float  r16_th2       = input.float(1.0, "Max (range)", group=grpR16)
+string r16_metric2   = input.string("q", "Compare Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR16)
+float  r16_off       = input.float(0.0, "Compare Offset (+/-)", step=0.1, group=grpR16)
+string r16_edge      = input.string("Rising Edge", "Trigger", options=["Rising Edge","Falling Edge","Any Edge","On True"], group=grpR16)
+bool   r16_confirm   = input.bool(true, "Confirm on bar close", group=grpR16)
+bool   r16_drawLbl   = input.bool(true, "Draw Label", group=grpR16)
+bool   r16_drawLine  = input.bool(false,"Draw Line", group=grpR16)
+string r16_priceSrc  = input.string("Close","Price Anchor", options=["Close","High","Low","HL2","OHLC4"], group=grpR16)
+float  r16_yoff      = input.float(0.0, "Price Y offset", step=0.1, group=grpR16)
+color  r16_col       = input.color(color.new(color.navy, 0), "Color", group=grpR16)
+string r16_lblSize   = input.string("Small","Label Size", options=["Tiny","Small","Normal","Large","Huge"], group=grpR16)
+string r16_lblStyle  = input.string("Auto", "Label Style", options=["Auto","Up","Down","Left","Right"], group=grpR16)
+
+bool r16_trig = ab_rule_run(15, r16_on, r16_name, r16_metric, r16_cmp, r16_mode, r16_th1, r16_th2, r16_metric2, r16_off, r16_edge, r16_confirm,
+                            r16_drawLbl, r16_drawLine, r16_priceSrc, r16_yoff, r16_col, r16_lblSize, r16_lblStyle, "R16", "Rule 16")
+alertcondition(ab_use_alertcondition and r16_trig, title="AOI AB Rule 16", message="AOI Alerts Builder - Rule 16 fired")
+
+// Rule 17
+string grpR17 = rule_block(17)
+bool   r17_on        = input.bool(false, "Enable", group=grpR17)
+string r17_name      = input.string("Pressure_used Inside Range [-0.5..0.5]", "Name", group=grpR17)
+string r17_metric    = input.string("Pressure_used", "Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR17)
+string r17_cmp       = input.string("Threshold", "Compare To", options=["Threshold","Metric"], group=grpR17)
+string r17_mode      = input.string("Inside Range", "Mode", options=["Above","Below","Cross Up","Cross Down","Inside Range","Outside Range","Rising","Falling"], group=grpR17)
+float  r17_th1       = input.float(-0.5, "Threshold / Min", group=grpR17)
+float  r17_th2       = input.float(0.5, "Max (range)", group=grpR17)
+string r17_metric2   = input.string("AOI_total", "Compare Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR17)
+float  r17_off       = input.float(0.0, "Compare Offset (+/-)", step=0.1, group=grpR17)
+string r17_edge      = input.string("Rising Edge", "Trigger", options=["Rising Edge","Falling Edge","Any Edge","On True"], group=grpR17)
+bool   r17_confirm   = input.bool(true, "Confirm on bar close", group=grpR17)
+bool   r17_drawLbl   = input.bool(true, "Draw Label", group=grpR17)
+bool   r17_drawLine  = input.bool(false,"Draw Line", group=grpR17)
+string r17_priceSrc  = input.string("Close","Price Anchor", options=["Close","High","Low","HL2","OHLC4"], group=grpR17)
+float  r17_yoff      = input.float(0.0, "Price Y offset", step=0.1, group=grpR17)
+color  r17_col       = input.color(color.new(color.gray, 0), "Color", group=grpR17)
+string r17_lblSize   = input.string("Small","Label Size", options=["Tiny","Small","Normal","Large","Huge"], group=grpR17)
+string r17_lblStyle  = input.string("Auto", "Label Style", options=["Auto","Up","Down","Left","Right"], group=grpR17)
+
+bool r17_trig = ab_rule_run(16, r17_on, r17_name, r17_metric, r17_cmp, r17_mode, r17_th1, r17_th2, r17_metric2, r17_off, r17_edge, r17_confirm,
+                            r17_drawLbl, r17_drawLine, r17_priceSrc, r17_yoff, r17_col, r17_lblSize, r17_lblStyle, "R17", "Rule 17")
+alertcondition(ab_use_alertcondition and r17_trig, title="AOI AB Rule 17", message="AOI Alerts Builder - Rule 17 fired")
+
+// Rule 18
+string grpR18 = rule_block(18)
+bool   r18_on        = input.bool(false, "Enable", group=grpR18)
+string r18_name      = input.string("Pressure_used Outside Range [-1..1]", "Name", group=grpR18)
+string r18_metric    = input.string("Pressure_used", "Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR18)
+string r18_cmp       = input.string("Threshold", "Compare To", options=["Threshold","Metric"], group=grpR18)
+string r18_mode      = input.string("Outside Range", "Mode", options=["Above","Below","Cross Up","Cross Down","Inside Range","Outside Range","Rising","Falling"], group=grpR18)
+float  r18_th1       = input.float(-1.0, "Threshold / Min", group=grpR18)
+float  r18_th2       = input.float(1.0, "Max (range)", group=grpR18)
+string r18_metric2   = input.string("AOI_total", "Compare Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR18)
+float  r18_off       = input.float(0.0, "Compare Offset (+/-)", step=0.1, group=grpR18)
+string r18_edge      = input.string("Rising Edge", "Trigger", options=["Rising Edge","Falling Edge","Any Edge","On True"], group=grpR18)
+bool   r18_confirm   = input.bool(true, "Confirm on bar close", group=grpR18)
+bool   r18_drawLbl   = input.bool(true, "Draw Label", group=grpR18)
+bool   r18_drawLine  = input.bool(false,"Draw Line", group=grpR18)
+string r18_priceSrc  = input.string("Close","Price Anchor", options=["Close","High","Low","HL2","OHLC4"], group=grpR18)
+float  r18_yoff      = input.float(0.0, "Price Y offset", step=0.1, group=grpR18)
+color  r18_col       = input.color(color.new(color.black, 0), "Color", group=grpR18)
+string r18_lblSize   = input.string("Small","Label Size", options=["Tiny","Small","Normal","Large","Huge"], group=grpR18)
+string r18_lblStyle  = input.string("Auto", "Label Style", options=["Auto","Up","Down","Left","Right"], group=grpR18)
+
+bool r18_trig = ab_rule_run(17, r18_on, r18_name, r18_metric, r18_cmp, r18_mode, r18_th1, r18_th2, r18_metric2, r18_off, r18_edge, r18_confirm,
+                            r18_drawLbl, r18_drawLine, r18_priceSrc, r18_yoff, r18_col, r18_lblSize, r18_lblStyle, "R18", "Rule 18")
+alertcondition(ab_use_alertcondition and r18_trig, title="AOI AB Rule 18", message="AOI Alerts Builder - Rule 18 fired")
+
+// Rule 19
+string grpR19 = rule_block(19)
+bool   r19_on        = input.bool(false, "Enable", group=grpR19)
+string r19_name      = input.string("AOI_diff Rising (Edge)", "Name", group=grpR19)
+string r19_metric    = input.string("AOI_diff", "Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR19)
+string r19_cmp       = input.string("Threshold", "Compare To", options=["Threshold","Metric"], group=grpR19)
+string r19_mode      = input.string("Rising", "Mode", options=["Above","Below","Cross Up","Cross Down","Inside Range","Outside Range","Rising","Falling"], group=grpR19)
+float  r19_th1       = input.float(0.0, "Threshold / Min", group=grpR19)
+float  r19_th2       = input.float(1.0, "Max (range)", group=grpR19)
+string r19_metric2   = input.string("AOI_total", "Compare Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR19)
+float  r19_off       = input.float(0.0, "Compare Offset (+/-)", step=0.1, group=grpR19)
+string r19_edge      = input.string("Rising Edge", "Trigger", options=["Rising Edge","Falling Edge","Any Edge","On True"], group=grpR19)
+bool   r19_confirm   = input.bool(true, "Confirm on bar close", group=grpR19)
+bool   r19_drawLbl   = input.bool(true, "Draw Label", group=grpR19)
+bool   r19_drawLine  = input.bool(false,"Draw Line", group=grpR19)
+string r19_priceSrc  = input.string("Close","Price Anchor", options=["Close","High","Low","HL2","OHLC4"], group=grpR19)
+float  r19_yoff      = input.float(0.0, "Price Y offset", step=0.1, group=grpR19)
+color  r19_col       = input.color(color.new(color.green, 0), "Color", group=grpR19)
+string r19_lblSize   = input.string("Small","Label Size", options=["Tiny","Small","Normal","Large","Huge"], group=grpR19)
+string r19_lblStyle  = input.string("Auto", "Label Style", options=["Auto","Up","Down","Left","Right"], group=grpR19)
+
+bool r19_trig = ab_rule_run(18, r19_on, r19_name, r19_metric, r19_cmp, r19_mode, r19_th1, r19_th2, r19_metric2, r19_off, r19_edge, r19_confirm,
+                            r19_drawLbl, r19_drawLine, r19_priceSrc, r19_yoff, r19_col, r19_lblSize, r19_lblStyle, "R19", "Rule 19")
+alertcondition(ab_use_alertcondition and r19_trig, title="AOI AB Rule 19", message="AOI Alerts Builder - Rule 19 fired")
+
+// Rule 20
+string grpR20 = rule_block(20)
+bool   r20_on        = input.bool(false, "Enable", group=grpR20)
+string r20_name      = input.string("AOI_diff Falling (Edge)", "Name", group=grpR20)
+string r20_metric    = input.string("AOI_diff", "Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR20)
+string r20_cmp       = input.string("Threshold", "Compare To", options=["Threshold","Metric"], group=grpR20)
+string r20_mode      = input.string("Falling", "Mode", options=["Above","Below","Cross Up","Cross Down","Inside Range","Outside Range","Rising","Falling"], group=grpR20)
+float  r20_th1       = input.float(0.0, "Threshold / Min", group=grpR20)
+float  r20_th2       = input.float(1.0, "Max (range)", group=grpR20)
+string r20_metric2   = input.string("AOI_total", "Compare Metric", options=["AOI_total","AOI_buy","AOI_sell","AOI_diff","AOI_activity","AOI_activity_ema","Pressure_raw","Pressure_norm","Pressure_used","P_fast","P_mid","P_slow","Vote","Conviction","Fusion","TPV","AbsMetric","Impedance","Entropy","TTT_sec","acc_AOI_total","acc%_AOI_total","acc_AOI_buy","acc%_AOI_buy","acc_AOI_sell","acc%_AOI_sell","acc_Activity","acc%_Activity","acc_P_used","acc%_P_used","acc_Abs","acc%_Abs","acc_Entropy","acc%_Entropy","acc_TTT","acc%_TTT","Jerk_PR","Norm_PR","Jerk_ACT","Norm_ACT","Jerk_ABS","Norm_ABS","acc_dir_ACT","acc_dir_ABS","coverage","vr","q","ok","AOI_per_vol","AOI_per_buyvol","AOI_per_sellvol","AOI_total_per_buyvol","AOI_total_per_sellvol"], group=grpR20)
+float  r20_off       = input.float(0.0, "Compare Offset (+/-)", step=0.1, group=grpR20)
+string r20_edge      = input.string("Rising Edge", "Trigger", options=["Rising Edge","Falling Edge","Any Edge","On True"], group=grpR20)
+bool   r20_confirm   = input.bool(true, "Confirm on bar close", group=grpR20)
+bool   r20_drawLbl   = input.bool(true, "Draw Label", group=grpR20)
+bool   r20_drawLine  = input.bool(false,"Draw Line", group=grpR20)
+string r20_priceSrc  = input.string("Close","Price Anchor", options=["Close","High","Low","HL2","OHLC4"], group=grpR20)
+float  r20_yoff      = input.float(0.0, "Price Y offset", step=0.1, group=grpR20)
+color  r20_col       = input.color(color.new(color.red, 0), "Color", group=grpR20)
+string r20_lblSize   = input.string("Small","Label Size", options=["Tiny","Small","Normal","Large","Huge"], group=grpR20)
+string r20_lblStyle  = input.string("Auto", "Label Style", options=["Auto","Up","Down","Left","Right"], group=grpR20)
+
+bool r20_trig = ab_rule_run(19, r20_on, r20_name, r20_metric, r20_cmp, r20_mode, r20_th1, r20_th2, r20_metric2, r20_off, r20_edge, r20_confirm,
+                            r20_drawLbl, r20_drawLine, r20_priceSrc, r20_yoff, r20_col, r20_lblSize, r20_lblStyle, "R20", "Rule 20")
+alertcondition(ab_use_alertcondition and r20_trig, title="AOI AB Rule 20", message="AOI Alerts Builder - Rule 20 fired")
+
+// نکته مهم برای ساخت Alert در TradingView:
+// - برای پیام‌های داینامیک: Alert بساز و Condition = "Any alert() function call"
+// - برای alertcondition: عنوان Rule را انتخاب کن (پیام ثابت است)
